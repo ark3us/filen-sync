@@ -15,7 +15,8 @@ import {
 	replacePathStartWithFromAndTo,
 	pathIncludesDotFile,
 	normalizeUTime,
-	isSyncedIgnoreFile
+	isSyncedIgnoreFile,
+	caseCollisionIncumbentWins
 } from "../../utils"
 import { v4 as uuidv4 } from "uuid"
 import { LOCAL_TRASH_NAME } from "../../constants"
@@ -303,7 +304,7 @@ export class RemoteFileSystem {
 			throw new Error("Invalid base folder parent.")
 		}
 
-		const pathsAdded: Record<string, boolean> = {}
+		const pathsAdded: Record<string, string> = {}
 		let size = 0
 		// Count of items whose metadata failed to decrypt (folders + files). Surfaced so the cycle can treat an
 		// incomplete read as non-destructive rather than letting skipped items look deleted. (decrypt resilience)
@@ -397,8 +398,17 @@ export class RemoteFileSystem {
 			}
 
 			const lowercasePath = folderPath.toLowerCase()
+			// pathsAdded stores only the winning path (a reference to an existing string, no per-item allocation); the
+			// incumbent's item is looked up on the rare collision path only.
+			const incumbentPath = pathsAdded[lowercasePath]
+			const incumbent = incumbentPath !== undefined ? this.getDirectoryTreeCache.tree[incumbentPath] : undefined
 
-			if (pathsAdded[lowercasePath]) {
+			// Deterministic case-collision resolution: a directory outranks a same-name file, otherwise the case-sensitively
+			// smaller path wins. Order-independent, so the surviving item is stable no matter which order the unordered
+			// response lists the two colliding items in - otherwise a collision flips the tree between runs and drives an
+			// endless delete+re-download / rename loop. The loser is ignored; the winner commits (demoting any previously
+			// added variant) once it passes isPathIgnored.
+			if (incumbent && caseCollisionIncumbentWins({ path: incumbent.path, isDirectory: incumbent.type === "directory" }, folderPath, true)) {
 				this.getDirectoryTreeCache.ignored.push({
 					localPath,
 					relativePath: folderPath,
@@ -407,8 +417,6 @@ export class RemoteFileSystem {
 
 				continue
 			}
-
-			pathsAdded[lowercasePath] = true
 
 			const ignored = this.isPathIgnored({
 				absolutePath: localPath,
@@ -427,6 +435,19 @@ export class RemoteFileSystem {
 				continue
 			}
 
+			if (incumbent) {
+				delete this.getDirectoryTreeCache.tree[incumbent.path]
+				delete this.getDirectoryTreeCache.uuids[incumbent.uuid]
+
+				this.getDirectoryTreeCache.ignored.push({
+					localPath: pathModule.join(this.sync.syncPair.localPath, incumbent.path),
+					relativePath: incumbent.path,
+					reason: "duplicate"
+				})
+
+				size -= 1
+			}
+
 			const item: RemoteItem = {
 				type: "directory",
 				uuid: folder[0],
@@ -437,6 +458,7 @@ export class RemoteFileSystem {
 
 			this.getDirectoryTreeCache.tree[folderPath] = item
 			this.getDirectoryTreeCache.uuids[folder[0]] = item
+			pathsAdded[lowercasePath] = folderPath
 
 			size += 1
 		}
@@ -469,8 +491,17 @@ export class RemoteFileSystem {
 						}
 
 						const lowercasePath = filePath.toLowerCase()
+						// pathsAdded stores only the winning path (no per-item allocation); the incumbent item is looked up
+						// on the rare collision path only.
+						const incumbentPath = pathsAdded[lowercasePath]
+						const incumbent = incumbentPath !== undefined ? this.getDirectoryTreeCache.tree[incumbentPath] : undefined
 
-						if (pathsAdded[lowercasePath]) {
+						// Deterministic case-collision resolution: a directory outranks a same-name file, otherwise the
+						// case-sensitively smaller path wins. Order-independent, so the surviving item is stable no matter
+						// which order the unordered response lists the two colliding items in - otherwise a collision flips
+						// the tree between runs and drives an endless delete+re-download / rename loop. The loser is ignored;
+						// the winner commits (demoting any previously added variant) once it passes isPathIgnored.
+						if (incumbent && caseCollisionIncumbentWins({ path: incumbent.path, isDirectory: incumbent.type === "directory" }, filePath, false)) {
 							this.getDirectoryTreeCache.ignored.push({
 								localPath,
 								relativePath: filePath,
@@ -479,8 +510,6 @@ export class RemoteFileSystem {
 
 							return
 						}
-
-						pathsAdded[lowercasePath] = true
 
 						const ignored = this.isPathIgnored({
 							absolutePath: localPath,
@@ -497,6 +526,19 @@ export class RemoteFileSystem {
 							})
 
 							return
+						}
+
+						if (incumbent) {
+							delete this.getDirectoryTreeCache.tree[incumbent.path]
+							delete this.getDirectoryTreeCache.uuids[incumbent.uuid]
+
+							this.getDirectoryTreeCache.ignored.push({
+								localPath: pathModule.join(this.sync.syncPair.localPath, incumbent.path),
+								relativePath: incumbent.path,
+								reason: "duplicate"
+							})
+
+							size -= 1
 						}
 
 						const item: RemoteItem = {
@@ -518,6 +560,7 @@ export class RemoteFileSystem {
 
 						this.getDirectoryTreeCache.tree[filePath] = item
 						this.getDirectoryTreeCache.uuids[item.uuid] = item
+						pathsAdded[lowercasePath] = filePath
 
 						size += 1
 					} catch (e) {

@@ -9,7 +9,8 @@ import {
 	isPathOverMaxLength,
 	isNameOverMaxLength,
 	isValidPath,
-	isSyncedIgnoreFile
+	isSyncedIgnoreFile,
+	caseCollisionIncumbentWins
 } from "../../utils"
 import pathModule from "path"
 import type Sync from "../sync"
@@ -35,7 +36,8 @@ const pipelineAsync = promisify(pipeline)
  * tree, plus unbounded pressure on the libuv thread pool and open file descriptors. Walking the entries
  * in fixed-size batches caps peak concurrency — and therefore peak memory — without reducing throughput,
  * since the thread pool only services a handful of these operations in parallel regardless of how many
- * are queued. Batches run sequentially, so the first-occurrence-wins dedup order is preserved exactly.
+ * are queued. Batches run sequentially; case-collision winners are resolved up front (see computeLocalCaseWinners),
+ * independent of batch order.
  */
 export const LOCAL_SCAN_CONCURRENCY = 1000
 
@@ -50,6 +52,54 @@ export type LocalItem = {
 
 export type LocalDirectoryTree = Record<string, LocalItem>
 export type LocalDirectoryINodes = Record<number, LocalItem>
+
+/**
+ * Decide the deterministic winner for each case-insensitive path collision among the raw fast-glob entries
+ * (markDirectories form: a trailing "/" marks a directory), returning the SET of winning raw entries. Pure and
+ * order-independent (exported for testing): feeding the same entries in any order yields the same winners, so the local
+ * tree does not flip between scans and cause churn. The scan gate then keeps an entry iff the set contains it — matching
+ * by the raw entry so the main loop needs no second lowercasing. See {@link caseCollisionIncumbentWins}.
+ *
+ * @param {readonly (string | null)[]} entries The raw fast-glob entries (with markDirectories trailing slash).
+ * @returns {Set<string>} the winning raw entries.
+ */
+export function computeLocalCaseWinners(entries: readonly (string | null)[]): Set<string> {
+	const winnerByLowercase = new Map<string, string>()
+
+	for (const rawEntry of entries) {
+		if (typeof rawEntry !== "string") {
+			continue
+		}
+
+		const isDirectory = rawEntry.endsWith("/")
+		const entryItem = isDirectory ? rawEntry.slice(0, -1) : rawEntry
+
+		if (entryItem.length === 0) {
+			continue
+		}
+
+		// Per-entry cost is one toLowerCase (no path allocation); the "/"-rooted paths the comparator expects are only
+		// materialised on an actual collision (rare). A shared leading "/" cannot change two names' relative order, so the
+		// lowercased bare item is a sound collision key.
+		const lowercase = entryItem.toLowerCase()
+		const incumbentEntry = winnerByLowercase.get(lowercase)
+
+		if (incumbentEntry === undefined) {
+			winnerByLowercase.set(lowercase, rawEntry)
+
+			continue
+		}
+
+		const incumbentIsDirectory = incumbentEntry.endsWith("/")
+		const incumbentItem = incumbentIsDirectory ? incumbentEntry.slice(0, -1) : incumbentEntry
+
+		if (!caseCollisionIncumbentWins({ path: "/" + incumbentItem, isDirectory: incumbentIsDirectory }, "/" + entryItem, isDirectory)) {
+			winnerByLowercase.set(lowercase, rawEntry)
+		}
+	}
+
+	return new Set(winnerByLowercase.values())
+}
 
 export type LocalTree = {
 	tree: LocalDirectoryTree
@@ -274,7 +324,6 @@ export class LocalFileSystem {
 				// the start guarantees any change racing with or following the walk has a change time >= this
 				// stamp, so the strict `<` fails and the next cycle rescans.
 				const scanStartedAt = Date.now()
-				const pathsAdded: Record<string, boolean> = {}
 				let size = 0
 				// Prune provably-.filenignore'd subtrees from the walk ITSELF, so the scan never descends into,
 				// stats, or even enumerates an ignored directory (e.g. node_modules) — and mark directories so an
@@ -298,6 +347,11 @@ export class LocalFileSystem {
 					markDirectories: true,
 					...(traversalIgnoreGlobs.length > 0 ? { ignore: traversalIgnoreGlobs } : {})
 				})
+
+				// Resolve case-insensitive collisions deterministically up front (order-independent), so the surviving
+				// variant is stable across scans regardless of the filesystem's traversal order — otherwise it could flip
+				// between runs and churn. Cheap synchronous string pass; the lstat/add below still runs only for winners.
+				const caseWinners = computeLocalCaseWinners(entries as unknown as (string | null)[])
 
 				for (let offset = 0; offset < entries.length; offset += LOCAL_SCAN_CONCURRENCY) {
 					await Promise.all(entries.slice(offset, offset + LOCAL_SCAN_CONCURRENCY).map(async rawEntry => {
@@ -323,9 +377,10 @@ export class LocalFileSystem {
 						}
 
 						const absolutePath = pathModule.join(this.sync.syncPair.localPath, entryItem)
-						const lowercasePath = entryPath.toLowerCase()
-
-						if (pathsAdded[lowercasePath]) {
+						// A case-insensitive path can appear more than once (e.g. "Foo"/"foo" on a case-sensitive filesystem).
+						// computeLocalCaseWinners already picked the deterministic winner (order-independent, matched by the raw
+						// glob entry so no second lowercasing is needed here); keep only that exact entry, ignore the others.
+						if (!caseWinners.has(markedEntry)) {
 							this.getDirectoryTreeCache.ignored.push({
 								localPath: absolutePath,
 								relativePath: entryPath,
@@ -334,8 +389,6 @@ export class LocalFileSystem {
 
 							return
 						}
-
-						pathsAdded[lowercasePath] = true
 
 						// Filter BEFORE the lstat: every isPathIgnored check is path/name-string based and needs only
 						// the entry type (which markDirectories already gave us), so an ignored entry costs no lstat or

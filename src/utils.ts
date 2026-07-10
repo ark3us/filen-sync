@@ -223,6 +223,29 @@ export function isValidPath(inputPath: string): boolean {
 	}
 }
 
+/**
+ * Deterministic winner for a case-insensitive path collision: a directory outranks a same-name file, otherwise the
+ * case-sensitively smaller path wins. Order-independent, so the surviving item is stable regardless of the order the two
+ * colliding entries arrive in (the /v3/dir/tree response is unordered; a filesystem walk's order is FS-defined). Without
+ * this, a case-collision could flip the tree between runs and drive an endless delete+re-download / rename loop.
+ *
+ * @param {{ path: string; isDirectory: boolean }} incumbent The item currently holding the lowercased-path slot.
+ * @param {string} candidatePath The colliding candidate's relative path.
+ * @param {boolean} candidateIsDirectory Whether the candidate is a directory.
+ * @returns {boolean} True if the incumbent keeps the slot; false if the candidate should replace it.
+ */
+export function caseCollisionIncumbentWins(
+	incumbent: { path: string; isDirectory: boolean },
+	candidatePath: string,
+	candidateIsDirectory: boolean
+): boolean {
+	if (incumbent.isDirectory !== candidateIsDirectory) {
+		return incumbent.isDirectory
+	}
+
+	return incumbent.path <= candidatePath
+}
+
 export function isNameIgnoredByDefault(name: string): boolean {
 	const nameLowercase = name.toLowerCase().trim()
 	const extension = pathModule.extname(nameLowercase)
