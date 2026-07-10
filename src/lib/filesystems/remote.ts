@@ -182,6 +182,34 @@ export class RemoteFileSystem {
 			}
 		}
 
+		// Decrypted item names are user-supplied and the tree path is built by raw string concat, so a "." / ".." segment
+		// survives (and pathModule.join later collapses it, hiding it from a resolved-path check alone). Reject any name that
+		// is not a single safe path component, any raw "." / ".." segment before normalization, and anything that does not
+		// resolve strictly inside the sync root - otherwise a later rename/move sink (fs-extra move -> remove(dest)) could
+		// target the sync root or an in-root directory. Reuses the existing "invalidPath" reason (no new type).
+		const rawSegments = relativePath.split("/")
+		const syncRootResolved = pathModule.resolve(this.sync.syncPair.localPath)
+		const absolutePathResolved = pathModule.resolve(absolutePath)
+
+		if (
+			name === "." ||
+			name === ".." ||
+			name.includes("/") ||
+			name.includes("\\") ||
+			rawSegments.some(segment => segment === "." || segment === "..") ||
+			!absolutePathResolved.startsWith(syncRootResolved + pathModule.sep)
+		) {
+			this.ignoredCache.set(key, {
+				ignored: true,
+				reason: "invalidPath"
+			})
+
+			return {
+				ignored: true,
+				reason: "invalidPath"
+			}
+		}
+
 		if (isRelativePathIgnoredByDefault(relativePath)) {
 			this.ignoredCache.set(key, {
 				ignored: true,

@@ -715,6 +715,19 @@ export class LocalFileSystem {
 
 			const fromLocalPath = pathModule.join(this.sync.syncPair.localPath, fromRelativePath)
 			const toLocalPath = pathModule.join(this.sync.syncPair.localPath, toRelativePath)
+
+			// Defense in depth: a rename/move must never target the sync root or escape it - fs-extra move overwrites and, for
+			// a cross-directory move, removes the destination first, so an out-of-root target could delete data outside the
+			// pair. Legitimate renames always resolve strictly inside the root (root itself is already rejected above).
+			const syncRootResolved = pathModule.resolve(this.sync.syncPair.localPath)
+
+			if (
+				!pathModule.resolve(fromLocalPath).startsWith(syncRootResolved + pathModule.sep) ||
+				!pathModule.resolve(toLocalPath).startsWith(syncRootResolved + pathModule.sep)
+			) {
+				throw new Error("Invalid paths.")
+			}
+
 			const fromLocalPathParentPath = pathModule.dirname(fromLocalPath)
 			const toLocalPathParentPath = pathModule.dirname(toLocalPath)
 
