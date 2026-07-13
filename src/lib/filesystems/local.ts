@@ -10,7 +10,8 @@ import {
 	isNameOverMaxLength,
 	isValidPath,
 	isSyncedIgnoreFile,
-	caseCollisionIncumbentWins
+	caseCollisionIncumbentWins,
+	assertPathWithinSyncRoot
 } from "../../utils"
 import pathModule from "path"
 import type Sync from "../sync"
@@ -635,6 +636,10 @@ export class LocalFileSystem {
 		algorithm: "sha512" | "md5" | "sha256"
 	}): Promise<string> {
 		const localPath = pathModule.join(this.sync.syncPair.localPath, relativePath)
+
+		// Sink guard: never read outside the sync root (uniform with the write sinks).
+		assertPathWithinSyncRoot(this.sync.syncPair.localPath, localPath)
+
 		const hasher = crypto.createHash(algorithm)
 
 		await pipelineAsync(this.sync.environment.fs.createReadStream(localPath), hasher)
@@ -659,6 +664,9 @@ export class LocalFileSystem {
 
 		try {
 			const localPath = pathModule.join(this.sync.syncPair.localPath, relativePath)
+
+			// Sink guard: a malicious `..` remote name must never create a directory outside the sync root.
+			assertPathWithinSyncRoot(this.sync.syncPair.localPath, localPath)
 
 			await this.sync.environment.fs.ensureDir(localPath)
 
@@ -697,6 +705,10 @@ export class LocalFileSystem {
 			}
 
 			const localPath = pathModule.join(this.sync.syncPair.localPath, relativePath)
+
+			// Sink guard: a delete/trash-move must never target a path outside the sync root (a malicious `..`
+			// name could otherwise delete arbitrary user data). The tree-membership check above already blocks it.
+			assertPathWithinSyncRoot(this.sync.syncPair.localPath, localPath)
 
 			try {
 				if (!permanent && !this.sync.localTrashDisabled) {
@@ -769,17 +781,12 @@ export class LocalFileSystem {
 			const fromLocalPath = pathModule.join(this.sync.syncPair.localPath, fromRelativePath)
 			const toLocalPath = pathModule.join(this.sync.syncPair.localPath, toRelativePath)
 
-			// Defense in depth: a rename/move must never target the sync root or escape it - fs-extra move overwrites and, for
-			// a cross-directory move, removes the destination first, so an out-of-root target could delete data outside the
-			// pair. Legitimate renames always resolve strictly inside the root (root itself is already rejected above).
-			const syncRootResolved = pathModule.resolve(this.sync.syncPair.localPath)
-
-			if (
-				!pathModule.resolve(fromLocalPath).startsWith(syncRootResolved + pathModule.sep) ||
-				!pathModule.resolve(toLocalPath).startsWith(syncRootResolved + pathModule.sep)
-			) {
-				throw new Error("Invalid paths.")
-			}
+			// Sink guard (defense in depth): a rename/move must never target the sync root or escape it - fs-extra
+			// move overwrites and, for a cross-directory move, removes the destination first, so an out-of-root
+			// target (a malicious `..` name) could delete data outside the pair. Both endpoints must stay strictly
+			// inside the root.
+			assertPathWithinSyncRoot(this.sync.syncPair.localPath, fromLocalPath)
+			assertPathWithinSyncRoot(this.sync.syncPair.localPath, toLocalPath)
 
 			const fromLocalPathParentPath = pathModule.dirname(fromLocalPath)
 			const toLocalPathParentPath = pathModule.dirname(toLocalPath)
@@ -878,6 +885,10 @@ export class LocalFileSystem {
 		passedMD5Hash?: string | undefined
 	}): Promise<CloudItem> {
 		const localPath = pathModule.join(this.sync.syncPair.localPath, relativePath)
+
+		// Sink guard: never read/upload a file from outside the sync root (uniform with the write sinks).
+		assertPathWithinSyncRoot(this.sync.syncPair.localPath, localPath)
+
 		const signalKey = `upload:${relativePath}`
 		const stats = await this.sync.environment.fs.stat(localPath)
 

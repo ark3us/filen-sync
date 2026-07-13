@@ -16,7 +16,8 @@ import {
 	pathIncludesDotFile,
 	normalizeUTime,
 	isSyncedIgnoreFile,
-	caseCollisionIncumbentWins
+	caseCollisionIncumbentWins,
+	assertPathWithinSyncRoot
 } from "../../utils"
 import { v4 as uuidv4 } from "uuid"
 import { LOCAL_TRASH_NAME } from "../../constants"
@@ -1060,6 +1061,12 @@ export class RemoteFileSystem {
 	 */
 	public async download({ relativePath }: { relativePath: string }): Promise<Stats> {
 		const localPath = pathModule.posix.join(this.sync.syncPair.localPath, relativePath)
+
+		// Sink guard: never let a traversal path (a malicious `..` remote name) move the downloaded file out of
+		// the sync root and overwrite an arbitrary user file. The tree-build filter already blocks it; this is
+		// the last line of defense at the actual write. (path-traversal hardening)
+		assertPathWithinSyncRoot(this.sync.syncPair.localPath, localPath)
+
 		const tmpLocalPath = pathModule.join(this.sync.syncPair.localPath, LOCAL_TRASH_NAME, uuidv4())
 		const signalKey = `download:${relativePath}`
 		const uuid = await this.pathToItemUUID({ relativePath })

@@ -224,6 +224,35 @@ export function isValidPath(inputPath: string): boolean {
 }
 
 /**
+ * Assert that a local filesystem path derived from a sync-relative path stays strictly INSIDE the sync root —
+ * the last-line sink guard against path traversal.
+ *
+ * Remote item names are attacker-controlled: a shared folder can carry a maliciously-crafted name whose
+ * decrypted value contains `..` segments, and the backend's end-to-end encryption means the name can only be
+ * validated client-side (a custom client can create a folder literally named `..`). The engine builds a local
+ * path by joining that name onto the sync root, and `path.join` silently COLLAPSES `..`, so the result can
+ * point OUTSIDE the root — a write there (a download move, mkdir, delete, or rename) could overwrite or delete
+ * arbitrary user files (e.g. `~/.bashrc` → RCE on next shell). The tree-build filter (`isPathIgnored`) already
+ * refuses such items up front; this validates again at every real filesystem sink so a stale pre-fix base
+ * entry or any filter gap can never reach a write. Fails LOUD (throws) rather than writing out of bounds; a
+ * legitimate synced path always resolves strictly within the root (the root itself is never a write target).
+ *
+ * @export
+ * @param {string} syncRoot The pair's local sync root.
+ * @param {string} localPath The already-joined local path about to be written/read.
+ */
+export function assertPathWithinSyncRoot(syncRoot: string, localPath: string): void {
+	const rootResolved = pathModule.resolve(syncRoot)
+	const resolved = pathModule.resolve(localPath)
+
+	// Strictly INSIDE the root — the root itself is never a legitimate write target (a rename/move onto it, or a
+	// delete of it, would clobber the whole pair), so reject it too.
+	if (!resolved.startsWith(rootResolved + pathModule.sep)) {
+		throw new Error("Path traversal blocked: a synced path resolves outside the sync root.")
+	}
+}
+
+/**
  * Deterministic winner for a case-insensitive path collision: a directory outranks a same-name file, otherwise the
  * case-sensitively smaller path wins. Order-independent, so the surviving item is stable regardless of the order the two
  * colliding entries arrive in (the /v3/dir/tree response is unordered; a filesystem walk's order is FS-defined). Without
