@@ -242,14 +242,39 @@ export function isValidPath(inputPath: string): boolean {
  * @param {string} localPath The already-joined local path about to be written/read.
  */
 export function assertPathWithinSyncRoot(syncRoot: string, localPath: string): void {
-	const rootResolved = pathModule.resolve(syncRoot)
-	const resolved = pathModule.resolve(localPath)
-
-	// Strictly INSIDE the root — the root itself is never a legitimate write target (a rename/move onto it, or a
-	// delete of it, would clobber the whole pair), so reject it too.
-	if (!resolved.startsWith(rootResolved + pathModule.sep)) {
+	if (!isPathWithinSyncRoot(syncRoot, localPath)) {
 		throw new Error("Path traversal blocked: a synced path resolves outside the sync root.")
 	}
+}
+
+/**
+ * Pure containment core behind {@link assertPathWithinSyncRoot} and the remote tree-build filter: is `localPath`
+ * strictly INSIDE `syncRoot` (the root itself excluded)?
+ *
+ * Uses `path.relative` rather than a lexical `resolved.startsWith(root + sep)`: when the sync root is a
+ * filesystem MOUNT ROOT — a Windows mapped-drive root (`Z:\`) or a UNC share root (`\\NAS\share`), the common
+ * Synology-over-SMB shape — `path.resolve()` already returns a value ending in a separator, so appending one
+ * more yields a DOUBLED separator (`Z:\\`, `\\NAS\share\\`) that no legitimate child can start with. That made
+ * the guard reject every synced item at a mount-root pair (v3.0.50: 7000+ "path traversal" errors). `relative`
+ * has no such edge: a strictly-inside child yields a non-empty, non-`..`, relative result. It also still
+ * rejects the classic prefix-sibling bypass (`/root` vs `/rootX`), a cross-drive target, and the root itself.
+ *
+ * @param pathImpl Injectable `path` implementation (defaults to host). Tests pass `path.win32` / `path.posix`
+ *   so the real Windows SMB shapes are asserted regardless of the host OS.
+ */
+export function isPathWithinSyncRoot(syncRoot: string, localPath: string, pathImpl: typeof pathModule = pathModule): boolean {
+	const rootResolved = pathImpl.resolve(syncRoot)
+	const resolved = pathImpl.resolve(localPath)
+	const relative = pathImpl.relative(rootResolved, resolved)
+
+	// Strictly inside: non-empty (root itself → ""), not the parent/an escape (".." or "..<sep>…"), and not
+	// re-absolutized (a different drive/root makes `relative` return an absolute path).
+	return (
+		relative.length > 0 &&
+		relative !== ".." &&
+		!relative.startsWith(".." + pathImpl.sep) &&
+		!pathImpl.isAbsolute(relative)
+	)
 }
 
 /**

@@ -58,4 +58,32 @@ describe.skipIf(!E2E_ENABLED)("E2E — path traversal sink guards", () => {
 			expect(await fs.pathExists(pathModule.join(world.localRoot, "legit.txt"))).toBe(true)
 		})
 	}, 1_800_000)
+
+	/**
+	 * Regression (v3.0.50), live against the real fs: when the sync root is a filesystem MOUNT ROOT — a Windows
+	 * mapped-drive root (`C:\`) or UNC share root (`\\NAS\share`), the common Synology-over-SMB shape — the
+	 * pre-fix containment check appended a second separator to the already-separator-terminated `resolve()`
+	 * output and rejected EVERY child as a traversal, so all files failed to sync (the ticket). Repoint the pair
+	 * at the tmp tree's actual drive/mount root (a genuine `C:\` on the windows-latest CI leg) and drive the real
+	 * mkdir sink at a child of it — it must create the directory, not throw. The target still lives inside our
+	 * tmp tree, so nothing outside is touched, and it is removed afterwards.
+	 */
+	it("F01-08-live-mountroot: a real write sink admits a child when the pair is rooted at a drive/mount root", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
+			const mountRoot = pathModule.parse(world.localRoot).root // "C:\\" on Windows, "/" on posix
+			// The relative path from the mount root down to a fresh dir inside our tmp tree.
+			const targetAbs = pathModule.join(world.localRoot, `mountroot-regression-${world.runId}`)
+			const relFromMountRoot = pathModule.sep + pathModule.relative(mountRoot, targetAbs)
+
+			world.syncPair.localPath = mountRoot
+
+			try {
+				// Pre-fix: threw "path traversal" for every child of a mount root. Post-fix: creates it.
+				await expect(world.sync.localFileSystem.mkdir({ relativePath: relFromMountRoot })).resolves.toBeDefined()
+				expect(await fs.pathExists(targetAbs), "mkdir did not create the child of a mount-root pair").toBe(true)
+			} finally {
+				await fs.remove(targetAbs)
+			}
+		})
+	}, 1_800_000)
 })

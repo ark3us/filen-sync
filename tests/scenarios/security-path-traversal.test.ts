@@ -109,4 +109,50 @@ describe("Security — path traversal via malicious remote names", () => {
 			expect(world.vfs.ifs.existsSync("/local/legit.txt")).toBe(true)
 		})
 	})
+
+	/**
+	 * Regression (v3.0.50): the two containment checks must NOT reject legitimate children when the sync root is
+	 * a filesystem MOUNT ROOT — a mapped-drive root (`Z:\`) or UNC share root (`\\NAS\share`), the common
+	 * Synology-over-SMB shape whose `path.resolve()` already ends in a separator. The pre-fix lexical
+	 * `startsWith(root + sep)` produced a doubled separator and refused EVERY item, so all files failed to sync.
+	 * The memfs mount-root analog is `/` (its `resolve()` carries the trailing separator). Point the pair at it
+	 * and assert both the tree-build filter and the throwing sink admit an ordinary in-root child.
+	 */
+	it("F01-08e: a MOUNT-ROOT sync pair still admits its own children (tree filter, not invalidPath)", async () => {
+		await withWorld(async world => {
+			// Re-root the pair at the memfs mount root — the doubled-separator trigger.
+			world.sync.syncPair.localPath = "/"
+
+			const child = world.sync.remoteFileSystem.isPathIgnored({
+				absolutePath: "/photos/holiday.jpg",
+				relativePath: "/photos/holiday.jpg",
+				name: "holiday.jpg",
+				type: "file"
+			})
+
+			expect(child.ignored, "a legitimate child of a mount-root pair was ignored").toBe(false)
+
+			// A genuine `..` escape must still be refused (invalidPath) even at a mount root.
+			const escape = world.sync.remoteFileSystem.isPathIgnored({
+				absolutePath: "/../evil.txt",
+				relativePath: "/../evil.txt",
+				name: "..",
+				type: "file"
+			})
+
+			expect(escape).toMatchObject({ ignored: true, reason: "invalidPath" })
+		})
+	})
+
+	it("F01-08f: a real write sink (mkdir) admits an in-root path at a MOUNT-ROOT pair", async () => {
+		await withWorld(async world => {
+			// Re-root at the memfs mount root, then drive the actual mkdir sink (which calls the containment
+			// guard internally). Pre-fix the doubled-separator check threw "path traversal" for every child, so
+			// no directory could ever be created; post-fix the child is created normally.
+			world.sync.syncPair.localPath = "/"
+
+			await expect(world.sync.localFileSystem.mkdir({ relativePath: "/photos" })).resolves.toBeDefined()
+			expect(world.vfs.ifs.existsSync("/photos")).toBe(true)
+		})
+	})
 })

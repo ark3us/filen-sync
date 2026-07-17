@@ -17,7 +17,8 @@ import {
 	normalizeUTime,
 	isSyncedIgnoreFile,
 	caseCollisionIncumbentWins,
-	assertPathWithinSyncRoot
+	assertPathWithinSyncRoot,
+	isPathWithinSyncRoot
 } from "../../utils"
 import { v4 as uuidv4 } from "uuid"
 import { LOCAL_TRASH_NAME } from "../../constants"
@@ -190,8 +191,6 @@ export class RemoteFileSystem {
 		// resolve strictly inside the sync root - otherwise a later rename/move sink (fs-extra move -> remove(dest)) could
 		// target the sync root or an in-root directory. Reuses the existing "invalidPath" reason (no new type).
 		const rawSegments = relativePath.split("/")
-		const syncRootResolved = pathModule.resolve(this.sync.syncPair.localPath)
-		const absolutePathResolved = pathModule.resolve(absolutePath)
 
 		if (
 			name === "." ||
@@ -199,7 +198,7 @@ export class RemoteFileSystem {
 			name.includes("/") ||
 			name.includes("\\") ||
 			rawSegments.some(segment => segment === "." || segment === "..") ||
-			!absolutePathResolved.startsWith(syncRootResolved + pathModule.sep)
+			!isPathWithinSyncRoot(this.sync.syncPair.localPath, absolutePath)
 		) {
 			this.ignoredCache.set(key, {
 				ignored: true,
