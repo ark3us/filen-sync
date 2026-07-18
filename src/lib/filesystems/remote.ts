@@ -268,6 +268,11 @@ export class RemoteFileSystem {
 		// transient crypto fault). >0 means the read is INCOMPLETE: the skipped items are absent from the tree,
 		// which the caller must not mistake for deletions (sync.ts carries the last-known state forward).
 		decryptErrors: number
+		// How many items were STRUCTURALLY orphaned this build: they decrypted fine but their parent folder
+		// tuple was absent from the /v3/dir/tree response, so they resolve to no path and vanish from the tree.
+		// Like decryptErrors, >0 means the read is INCOMPLETE and its absences must not be read as deletions —
+		// the one inconsistent-response shape the decrypt-error guard alone did not cover.
+		structuralErrors: number
 	}> {
 		const deviceId = await this.getDeviceId()
 		const dir = await this.sync.environment.fetchDirTree(this.sync.sdk, {
@@ -288,7 +293,8 @@ export class RemoteFileSystem {
 				result: this.getDirectoryTreeCache,
 				ignored: this.getDirectoryTreeCache.ignored,
 				changed: false,
-				decryptErrors: 0
+				decryptErrors: 0,
+				structuralErrors: 0
 			}
 		}
 
@@ -309,6 +315,11 @@ export class RemoteFileSystem {
 		// Count of items whose metadata failed to decrypt (folders + files). Surfaced so the cycle can treat an
 		// incomplete read as non-destructive rather than letting skipped items look deleted. (decrypt resilience)
 		let decryptErrors = 0
+		// Count of items that decrypted fine but were orphaned by an ABSENT parent folder tuple (a broken parent
+		// chain in the response). Same non-destructive treatment as decryptErrors — an orphan's disappearance is
+		// an inconsistent read, not a deletion, so the cycle carries the last-known state forward. (structural
+		// resilience)
+		let structuralErrors = 0
 
 		this.getDirectoryTreeCache.ignored = []
 		this.getDirectoryTreeCache.tree = {}
@@ -386,8 +397,17 @@ export class RemoteFileSystem {
 
 			const folderPath = resolveFolderPath(folder[0], 0)
 
-			// undefined => orphan (broken parent chain); "" => the sync root. Neither is a tree entry.
-			if (folderPath === undefined || folderPath.length === 0) {
+			// undefined => orphan (broken/absent parent chain): a decrypted folder that resolves to no path
+			// because an ancestor tuple is missing. Its whole subtree silently vanishes from the tree, so flag
+			// the read as structurally incomplete (the cycle then carries the base forward instead of deleting).
+			if (folderPath === undefined) {
+				structuralErrors++
+
+				continue
+			}
+
+			// "" => the sync root itself — legitimately not a tree entry, and NOT an orphan.
+			if (folderPath.length === 0) {
 				continue
 			}
 
@@ -478,8 +498,12 @@ export class RemoteFileSystem {
 
 						const parentPath = folderPathByUUID.get(file[4])
 
-						// Orphan file (its parent folder was absent from the response) — skip it.
+						// Orphan file (its parent folder was absent from the response) — skip it, and flag the read
+						// as structurally incomplete so the cycle carries the base forward instead of reading the
+						// file's disappearance as a deletion.
 						if (parentPath === undefined) {
+							structuralErrors++
+
 							return
 						}
 
@@ -584,7 +608,8 @@ export class RemoteFileSystem {
 			},
 			ignored: this.getDirectoryTreeCache.ignored,
 			changed: true,
-			decryptErrors
+			decryptErrors,
+			structuralErrors
 		}
 	}
 

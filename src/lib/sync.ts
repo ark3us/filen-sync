@@ -448,17 +448,19 @@ export class Sync {
 					this.remoteFileSystem.getDirectoryTree()
 				])
 
-				// An INCOMPLETE remote read (one or more items whose metadata could not be decrypted — a corrupted
-				// entry, or a transient crypto fault) must never be mistaken for deletions. A skipped item is absent
-				// from the fresh tree, indistinguishable from a removal, so the remote-deletion pass would delete the
-				// synced LOCAL copy: silent data loss. The skipped item's PATH is unknown (its name lives in the
-				// un-decryptable metadata), so recover it from the persisted base by uuid and carry the last-known
+				// An INCOMPLETE remote read must never be mistaken for deletions. Two shapes make it incomplete:
+				// (1) an item whose metadata could not be decrypted (a corrupted entry or transient crypto fault),
+				// and (2) a STRUCTURAL orphan — an item that decrypted fine but whose parent folder tuple was absent
+				// from the /v3/dir/tree response, so it resolves to no path. Either way the item is absent from the
+				// fresh tree, indistinguishable from a removal, so the remote-deletion pass would delete the synced
+				// LOCAL copy: silent data loss. Recover from the persisted base by uuid and carry the last-known
 				// state forward — any base remote item missing from this read is re-asserted at its base path (unless
 				// that path was legitimately reused by a readable item). Genuine remote deletions simply wait for a
-				// clean read (self-healing); a permanently-corrupt item only ever blocks its own neighbourhood's
-				// deletions, never causes a wrong one. Mirrors the existing "malformed tree must not read as a
-				// mass-deletion" guard in remote.ts. Runs ONLY when a decrypt error occurred — zero cost otherwise.
-				if (currentRemoteTree.decryptErrors > 0) {
+				// clean read (self-healing); a permanently-broken item only ever blocks its own neighbourhood's
+				// deletions, never causes a wrong one. Mirrors the "malformed tree must not read as a mass-deletion"
+				// guard in remote.ts and the local partial-scan guard below. Runs ONLY when the read was incomplete —
+				// zero cost otherwise.
+				if (currentRemoteTree.decryptErrors > 0 || currentRemoteTree.structuralErrors > 0) {
 					const current = currentRemoteTree.result
 
 					for (const uuid in this.previousRemoteTree.uuids) {

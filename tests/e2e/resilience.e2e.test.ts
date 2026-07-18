@@ -9,6 +9,7 @@ import { withE2EWorld, restartE2EWorld } from "./harness/world"
 import { cycle, settle, expectConverged, allOps, messagesOfType } from "./harness/drive"
 import { snapshotRemoteReal } from "./harness/assert"
 import { writeLocal, modifyLocal, rmLocal, renameLocal, uploadRemote, chmodLocal, existsLocal } from "./harness/mutations"
+import { type SyncDirTreeFetcher } from "../../src/lib/filesystems/dirTree"
 
 /**
  * Phase 3 e2e — resilience + long-lived stability against the live backend. The mocked suite injects
@@ -177,6 +178,55 @@ describe.skipIf(!E2E_ENABLED)("E2E — resilience & long-lived stability", () =>
 				await world.worker.updateRemoved(world.syncPair.uuid, true).catch(() => {})
 				await cyclePromise.catch(() => {})
 			}
+		})
+	})
+
+	it("a structural orphan in the dir tree does NOT delete the orphaned subtree locally (Fix #3, data-loss guard)", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
+			await writeLocal(world, "keep.txt", "k")
+			await writeLocal(world, "docs/top.txt", "t")
+			await writeLocal(world, "docs/sub/file.txt", "f")
+			await writeLocal(world, "docs/sub/deep/leaf.txt", "l")
+			await settle(world)
+			await expectConverged(world)
+
+			// The real remote UUID of the intermediate folder /docs/sub, from the freshly built tree.
+			const subUUID = world.sync.remoteFileSystem.getDirectoryTreeCache.tree["/docs/sub"]?.uuid
+
+			expect(subUUID, "precondition: /docs/sub must be present in the remote tree").toBeTruthy()
+
+			// Wrap the tree fetch to OMIT that one folder tuple: its whole subtree becomes present-but-parentless
+			// (a structural orphan) even though every returned item still decrypts (decryptErrors stays 0).
+			const realFetcher = world.sync.environment.fetchDirTree
+
+			world.sync.environment.fetchDirTree = (async (fsdk, request) => {
+				const full = await realFetcher(fsdk, { ...request, skipCache: true })
+
+				return { ...full, folders: full.folders.filter(folder => folder[0] !== subUUID) }
+			}) as SyncDirTreeFetcher
+
+			try {
+				// Drive a cycle against the orphaned response. Without the fix the subtree reads as deleted and its
+				// local copies are trashed; with it the base is carried forward and nothing is deleted.
+				await cycle(world)
+
+				expect(await existsLocal(world, "docs/sub/file.txt"), "orphaned file was deleted locally").toBe(true)
+				expect(await existsLocal(world, "docs/sub/deep/leaf.txt")).toBe(true)
+				expect(await existsLocal(world, "docs/top.txt")).toBe(true)
+				expect(await existsLocal(world, "keep.txt")).toBe(true)
+			} finally {
+				world.sync.environment.fetchDirTree = realFetcher
+			}
+
+			// The response recovers; the tree re-reads cleanly and stays converged with everything intact.
+			await settle(world)
+			await expectConverged(world)
+
+			const remote = await snapshotRemoteReal(world)
+
+			expect(remote["/docs/sub/file.txt"]).toMatchObject({ type: "file" })
+			expect(remote["/docs/sub/deep/leaf.txt"]).toMatchObject({ type: "file" })
+			expect(await existsLocal(world, "docs/sub/file.txt")).toBe(true)
 		})
 	})
 
