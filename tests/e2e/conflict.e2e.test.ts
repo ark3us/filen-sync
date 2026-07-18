@@ -14,6 +14,7 @@ import {
 	uploadRemote,
 	deleteRemote,
 	renameRemote,
+	renameRemoteDir,
 	setLocalMtime,
 	existsLocal
 } from "./harness/mutations"
@@ -307,6 +308,64 @@ describe.skipIf(!E2E_ENABLED)("E2E — twoWay conflict resolution", () => {
 			const remote = await snapshotRemoteReal(world)
 			expect(remote["/a.txt"]).toBeUndefined()
 			expect(remote["/b.txt"]).toMatchObject({ type: "file" })
+		})
+	})
+
+	// --- #10: cross-side NESTED directory renames at different levels, with the nested file ALSO modified ---
+	// The mocked XD2/XD4 pin this against the fake cloud (where a modify replaces the inode); these exercise the
+	// live backend, where a rename+modify PRESERVES the inode and the engine takes the explicit file-rename path.
+
+	it("local renames OUTER + modifies nested file, remote renames INNER → both compose, no duplicate (#10 / XD2)", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
+			await writeLocal(world, "top/mid/file.txt", "ORIGINAL")
+			await writeLocal(world, "top/keep.txt", "K")
+			await settle(world)
+			await expectConverged(world)
+
+			// Local: rename the OUTER dir /top -> /top2 AND modify the deeply-nested file (clearly-newer mtime).
+			await renameLocal(world, "top", "top2")
+			await modifyLocal(world, "top2/mid/file.txt", "MODIFIED-LONGER-CONTENT")
+			// Remote (a peer): rename the INNER dir /top/mid -> /top/mid2 in the same window.
+			await renameRemoteDir(world, "top/mid", "top/mid2")
+
+			await settle(world)
+			await expectConverged(world)
+
+			const remote = await snapshotRemoteReal(world)
+
+			// Both renames compose: the modified file lands at /top2/mid2/file.txt with the NEW bytes, and NEITHER
+			// pre-rename position lingers (the #10 permanent duplicate).
+			expect(remote["/top2/mid2/file.txt"]).toMatchObject({ type: "file", size: "MODIFIED-LONGER-CONTENT".length })
+			expect(remote["/top2/mid/file.txt"]).toBeUndefined()
+			expect(remote["/top2/mid"]).toBeUndefined()
+			expect(remote["/top2/keep.txt"]).toMatchObject({ type: "file" })
+			expect(await readLocal(world, "top2/mid2/file.txt")).toBe("MODIFIED-LONGER-CONTENT")
+		})
+	})
+
+	it("remote renames OUTER + modifies nested file, local renames INNER → both compose, no duplicate (#10 / XD4)", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
+			await writeLocal(world, "top/mid/file.txt", "ORIGINAL")
+			await writeLocal(world, "top/keep.txt", "K")
+			await settle(world)
+			await expectConverged(world)
+
+			// Remote (a peer): rename the OUTER dir /top -> /top2 AND re-upload the nested file with new content.
+			await renameRemoteDir(world, "top", "top2")
+			await uploadRemote(world, "top2/mid/file.txt", "REMOTE-MODIFIED-LONGER")
+			// Local: rename the INNER dir /top/mid -> /top/mid2 in the same window.
+			await renameLocal(world, "top/mid", "top/mid2")
+
+			await settle(world)
+			await expectConverged(world)
+
+			const remote = await snapshotRemoteReal(world)
+
+			expect(remote["/top2/mid2/file.txt"]).toMatchObject({ type: "file", size: "REMOTE-MODIFIED-LONGER".length })
+			expect(remote["/top2/mid/file.txt"]).toBeUndefined()
+			expect(remote["/top2/mid"]).toBeUndefined()
+			expect(remote["/top2/keep.txt"]).toMatchObject({ type: "file" })
+			expect(await readLocal(world, "top2/mid2/file.txt")).toBe("REMOTE-MODIFIED-LONGER")
 		})
 	})
 })

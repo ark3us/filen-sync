@@ -600,6 +600,12 @@ export class Deltas {
 		const renamedLocalDirectories: Delta[] = []
 		const deletedRemoteDirectories: Delta[] = []
 		const deletedLocalDirectories: Delta[] = []
+		// A directory rename's `from`/`to` on the delta is expressed in the OPERATING side's CURRENT-tree paths
+		// (where the executor must find and place it), which for a rename cross-blocked by the OTHER side's
+		// ancestor rename differs from its BASE path. The base-tree rebase below must instead key off the BASE
+		// path (that is where the item sits in the not-yet-rebased base), so remember each dir rename's base
+		// `from` here. Identity for an un-cross-blocked rename (base path === current path). (#10)
+		const dirRenameBaseFrom = new Map<Delta, string>()
 		let deleteLocalDirectoryCountRaw = 0
 		let deleteLocalFileCountRaw = 0
 		let deleteRemoteDirectoryCountRaw = 0
@@ -643,6 +649,30 @@ export class Deltas {
 		// 4. Remote deletions
 		// 5. Local additions/filemodifications
 		// 6. Remote additions/filemodifications
+
+		// The REMOTE's own directory renames this cycle (uuid preserved, path changed), used ONLY to rebase a
+		// LOCAL rename's remote-source lookup when the remote renamed an ANCESTOR directory in the same cycle
+		// (the cross-side nested rename, #10 / XD4). The pass below runs BEFORE the remote-rename pass, so unlike
+		// the remote pass — which reuses the already-emitted local renames — it has no emitted list to consult and
+		// derives the geometry directly. Built at most once per cycle and ONLY when a base-path source lookup
+		// actually misses, so a cycle without a cross-blocked local rename never pays the O(remote) scan.
+		let remoteGeoDirRenamesCache: { from: string; to: string }[] | null = null
+		const getRemoteGeoDirRenames = (): { from: string; to: string }[] => {
+			if (remoteGeoDirRenamesCache === null) {
+				remoteGeoDirRenamesCache = []
+
+				for (const uuid in currentRemoteTree.uuids) {
+					const cur = currentRemoteTree.uuids[uuid]
+					const prev = previousRemoteTree.uuids[uuid]
+
+					if (cur && prev && cur.type === "directory" && prev.type === "directory" && cur.path !== prev.path) {
+						remoteGeoDirRenamesCache.push({ from: prev.path, to: cur.path })
+					}
+				}
+			}
+
+			return remoteGeoDirRenamesCache
+		}
 
 		// Local file/directory move/rename
 		if (mode === "twoWay" || mode === "localBackup" || mode === "localToCloud") {
@@ -707,7 +737,26 @@ export class Deltas {
 					// it, leave the paths unmarked, and let the renamed item be re-added under its new name
 					// while the other side's change is applied by its own pass. The worlds still converge,
 					// keeping both edits rather than silently dropping one. (F2–F4)
-					const remoteSource = currentRemoteTree.tree[previousItem.path]
+					//
+					// The source is looked up in the current remote tree at the base path. When that MISSES, the
+					// remote may have carried the source elsewhere by renaming an ANCESTOR directory this cycle:
+					// rebase the base path across the remote's own dir renames and retry, so a cross-side nested
+					// rename composes instead of decomposing into delete+add (#10 / XD4, symmetric to the remote
+					// pass). The geo scan is built lazily on this first miss, so the common case never pays it.
+					let remoteSourcePath = previousItem.path
+					let remoteRebasedTarget = currentItem.path
+					let remoteSource = currentRemoteTree.tree[remoteSourcePath]
+
+					if (!remoteSource) {
+						const rebasedSource = rebasePathAcrossRenames(previousItem.path, getRemoteGeoDirRenames())
+
+						if (rebasedSource !== remoteSourcePath) {
+							remoteSourcePath = rebasedSource
+							remoteRebasedTarget = rebasePathAcrossRenames(currentItem.path, getRemoteGeoDirRenames())
+							remoteSource = currentRemoteTree.tree[remoteSourcePath]
+						}
+					}
+
 					const baseRemoteSource = previousRemoteTree.tree[previousItem.path]
 					const remoteSourceUnchanged = !!remoteSource && !!baseRemoteSource && remoteSource.uuid === baseRemoteSource.uuid
 
@@ -717,19 +766,20 @@ export class Deltas {
 
 					const delta: Delta = {
 						type: currentItem.type === "directory" ? "renameRemoteDirectory" : "renameRemoteFile",
-						path: currentItem.path,
-						from: previousItem.path,
-						to: currentItem.path
+						path: remoteRebasedTarget,
+						from: remoteSourcePath,
+						to: remoteRebasedTarget
 					}
 
 					deltas.push(delta)
 
 					if (currentItem.type === "directory") {
 						renamedRemoteDirectories.push(delta)
+						dirRenameBaseFrom.set(delta, previousItem.path)
 					}
 
-					pathsAdded[currentItem.path] = true
-					pathsAdded[previousItem.path] = true
+					pathsAdded[remoteRebasedTarget] = true
+					pathsAdded[remoteSourcePath] = true
 
 					// Rename + in-place content modify of the SAME file in ONE cycle: the rename marks the new
 					// path "added", so the modification pass below would skip it and the new bytes would never
@@ -745,7 +795,7 @@ export class Deltas {
 						if (contentChanged) {
 							deltas.push({
 								type: "uploadFile",
-								path: currentItem.path,
+								path: remoteRebasedTarget,
 								size: currentItem.size
 							})
 						}
@@ -756,6 +806,22 @@ export class Deltas {
 
 		// Remote file/directory move/rename
 		if (mode === "twoWay" || mode === "cloudBackup" || mode === "cloudToLocal") {
+			// Local-originated directory renames already emitted by the pass above (as renameRemoteDirectory
+			// deltas). A remote rename whose SOURCE sits inside a directory the LOCAL side renamed in this same
+			// cycle has physically moved on disk — it is at its base path only in the (not-yet-rebased) base tree,
+			// but lives under the local rename's target now. Looking the source up at the base path therefore
+			// MISSES and the remote rename is silently dropped, decomposing into delete+add. When the descendant
+			// is ALSO modified on the renaming side, that decomposition strands the edit at the pre-inner-rename
+			// path AND re-creates it at the composed path: a permanent duplicate (#10 / XD2). Rebase the source
+			// LOOKUP and the emitted from/to to where that subtree now lives locally. Empty in the common
+			// single-side cycle, so rebasePathAcrossRenames is a no-op and this costs nothing. (#10)
+			const localOriginatedDirRenames = renamedRemoteDirectories.flatMap(delta =>
+				delta.type === "renameRemoteDirectory" ? [{ from: delta.from, to: delta.to }] : []
+			)
+			// Zero local directory renames this cycle (the overwhelmingly common case) → no source can be
+			// cross-blocked, so skip the per-item rebase entirely and use the paths as-is.
+			const hasLocalDirRenames = localOriginatedDirRenames.length > 0
+
 			for (const uuid in currentRemoteTree.uuids) {
 				const currentItem = currentRemoteTree.uuids[uuid]
 				const previousItem = previousRemoteTree.uuids[uuid]
@@ -763,6 +829,11 @@ export class Deltas {
 				if (!currentItem || !previousItem || pathsAdded[currentItem.path] || pathsAdded[previousItem.path]) {
 					continue
 				}
+
+				// Where this item's base path and its current-remote path map to on the LOCAL disk after the local
+				// side's own directory renames this cycle (identity for an item outside any locally-renamed subtree).
+				const localSourcePath = hasLocalDirRenames ? rebasePathAcrossRenames(previousItem.path, localOriginatedDirRenames) : previousItem.path
+				const localTargetPath = hasLocalDirRenames ? rebasePathAcrossRenames(currentItem.path, localOriginatedDirRenames) : currentItem.path
 
 				// Path from current item changed, it was either renamed or moved (same type)
 				if (
@@ -772,10 +843,11 @@ export class Deltas {
 					// local-rename guard above: a same-type occupant was probably moved there independently, and a
 					// DIFFERENT-type occupant (file↔directory name swap) cannot be overwritten by a rename — leave
 					// the path unmarked so the type-change / addition / deletion passes rebuild it via delete+recreate.
-					!currentLocalTree.tree[currentItem.path] &&
+					// Evaluated at the REBASED local target (where the rename actually lands on disk).
+					!currentLocalTree.tree[localTargetPath] &&
 					// Symmetric to the local pass: the destination's parent must not currently be a file (a child
 					// moving into a directory mid-type-change). Suppress so the addition pass rebuilds it locally.
-					!renameDestinationBlockedByFileAncestor(currentLocalTree, currentItem.path) &&
+					!renameDestinationBlockedByFileAncestor(currentLocalTree, localTargetPath) &&
 					// Because only comparing strings can be weird sometimes
 					Buffer.from(currentItem.path, "utf-8").toString("hex") !== Buffer.from(previousItem.path, "utf-8").toString("hex")
 				) {
@@ -785,7 +857,8 @@ export class Deltas {
 					// let a remote rename fire over a file the user edited in the same window and silently drop
 					// that edit. If the local side deleted, modified, or renamed it, skip the rename and let
 					// the file be handled by the deletion/addition passes → convergence, keeping both. (F2–F4)
-					const localSource = currentLocalTree.tree[previousItem.path]
+					// The source is looked up at its REBASED local path; the base is the un-rebased base tree.
+					const localSource = currentLocalTree.tree[localSourcePath]
 					const baseLocalSource = previousLocalTree.tree[previousItem.path]
 					const localSourceUnchanged =
 						!!localSource &&
@@ -802,19 +875,20 @@ export class Deltas {
 
 					const delta: Delta = {
 						type: currentItem.type === "directory" ? "renameLocalDirectory" : "renameLocalFile",
-						path: currentItem.path,
-						from: previousItem.path,
-						to: currentItem.path
+						path: localTargetPath,
+						from: localSourcePath,
+						to: localTargetPath
 					}
 
 					deltas.push(delta)
 
 					if (currentItem.type === "directory") {
 						renamedLocalDirectories.push(delta)
+						dirRenameBaseFrom.set(delta, previousItem.path)
 					}
 
-					pathsAdded[currentItem.path] = true
-					pathsAdded[previousItem.path] = true
+					pathsAdded[localTargetPath] = true
+					pathsAdded[localSourcePath] = true
 				}
 			}
 		}
@@ -892,16 +966,28 @@ export class Deltas {
 			// (Re)build the rename lists from the (possibly corrected) delta objects, then model the post-rename
 			// state. The base follows BOTH sides' renames; each side's CURRENT tree follows only the OTHER side's
 			// rename (its own rename already moved its current tree to the new path).
+			//
+			// The delta `from` is the OPERATING side's CURRENT-tree path (where the executor acts). For the
+			// CURRENT-tree rebases that is exactly right — the other side's current tree holds the item at that
+			// same path. But the BASE tree holds it at its BASE path, which for a rename cross-blocked by the
+			// other side's ancestor rename differs from the current path (`dirRenameBaseFrom`). Rebase the base
+			// off the base `from`; both share the SAME composed `to` (the item's final position). Without this
+			// split a nested cross-side rename mis-composes the base subtree (only the outer rename applies), and
+			// the descendant then reads as delete-old-path + add-new-path instead of a clean rename. (#10)
 			const localOriginatedRenames = renamedRemoteDirectories.flatMap(delta =>
 				delta.type === "renameRemoteDirectory" ? [{ from: delta.from, to: delta.to }] : []
 			)
 			const remoteOriginatedRenames = renamedLocalDirectories.flatMap(delta =>
 				delta.type === "renameLocalDirectory" ? [{ from: delta.from, to: delta.to }] : []
 			)
-			const allDirRenames = [...localOriginatedRenames, ...remoteOriginatedRenames]
+			const allDirRenamesForBase = [...renamedRemoteDirectories, ...renamedLocalDirectories].flatMap(delta =>
+				delta.type === "renameRemoteDirectory" || delta.type === "renameLocalDirectory"
+					? [{ from: dirRenameBaseFrom.get(delta) ?? delta.from, to: delta.to }]
+					: []
+			)
 
-			previousLocalTree = rebaseLocalTreeAcrossRenames(previousLocalTree, allDirRenames)
-			previousRemoteTree = rebaseRemoteTreeAcrossRenames(previousRemoteTree, allDirRenames)
+			previousLocalTree = rebaseLocalTreeAcrossRenames(previousLocalTree, allDirRenamesForBase)
+			previousRemoteTree = rebaseRemoteTreeAcrossRenames(previousRemoteTree, allDirRenamesForBase)
 			currentRemoteTree = rebaseRemoteTreeAcrossRenames(currentRemoteTree, localOriginatedRenames)
 			currentLocalTree = rebaseLocalTreeAcrossRenames(currentLocalTree, remoteOriginatedRenames)
 		}

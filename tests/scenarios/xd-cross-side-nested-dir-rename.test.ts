@@ -10,15 +10,16 @@ import { BASE_TIME } from "../harness/world"
  * ZB / ZW pin a directory renamed on one side while a DESCENDANT (file or child rename/move) changes on
  * the other. The untested shape here is two DIRECTORY renames at DIFFERENT levels of the same chain, one
  * per side: e.g. local renames the OUTER directory /top → /top2 while remote renames the INNER directory
- * /top/mid → /top/mid2. The correct merge applies BOTH renames (→ /top2/mid2/...), which the engine reaches
- * by propagating the outer rename and degrading the cross-blocked inner rename into delete+re-create of the
- * inner subtree on the slower side. This exercises the rename-aware rebase (rebase{Local,Remote}TreeAcross
- * Renames + rebasePathAcrossRenames) COMPOSING an outer rename from one side with an inner rename from the
- * other — a path neither ZB (descendant change) nor ZW (child rename) reaches.
+ * /top/mid → /top/mid2. The correct merge applies BOTH renames (→ /top2/mid2/...). The cross-blocked inner
+ * rename would MISS at detection — its source lookup keys off the base path, but the other side's outer
+ * rename has already moved that subtree — so each rename pass rebases its cross-side source lookup (and the
+ * emitted from/to) across the OTHER side's directory renames, and the base tree is rebased off the base-path
+ * `from` (rebase{Local,Remote}TreeAcrossRenames + rebasePathAcrossRenames), COMPOSING the two renames into a
+ * single move on each side — a path neither ZB (descendant change) nor ZW (child rename) reaches.
  *
- * Critical safety: when the deeply-nested file is ALSO modified on the renaming side, the inner-rename
- * degradation must NOT delete+re-download over the local edit (the BUG-A class). XD2/XD4 guard that — the
- * modified content must survive on both sides.
+ * Critical safety: when the deeply-nested file is ALSO modified on the renaming side, the composition must NOT
+ * strand the edit at the pre-rename path or duplicate it (the BUG-A / #10 class). XD2/XD4 guard that — the
+ * modified content must land at the composed path on both sides with no lingering copy.
  *
  * Distinct names (top/top2, mid/mid2) avoid the case-insensitive-per-parent backend folding /a and /A.
  */
@@ -56,19 +57,15 @@ describe("Category XD — cross-side nested directory renames (different levels)
 		expect(result.finalLocal["/top2/mid2/file.txt"]!.contentHash).toBe(result.finalRemote["/top2/mid2/file.txt"]!.contentHash)
 	})
 
-	// KNOWN LIMITATION (#10) — pinned as an expected-failure. A cross-side nested dir-rename where the file is
-	// ALSO modified on the renaming side leaves a permanent DUPLICATE: the modified edit is stranded at the
-	// pre-inner-rename path AND a copy appears at the composed path (both sides converge to the duplicate, so
-	// there is NO data loss). Root cause: the remote inner rename is dropped at DETECTION — the pass's
-	// source-unchanged check looks up the moved source at its pre-outer-rename path and misses it — so the move
-	// decomposes into delete+add and the local modify then preserves the old path. A correct fix must restructure
-	// the rename-detection ordering (a cross-side dir-rename pre-scan so each pass rebases its source lookup) AND
-	// the composition rebase together; a partial attempt reintroduced the duplicate into the WORKING no-modify
-	// case (XD1), so it needs dedicated review of the engine's most delicate, data-loss-critical path rather than
-	// a rushed change. Strengthened assertions (from a `some(size)` check a duplicate passed) are kept under
-	// it.fails so the bug is CI-visible and this test flips to a hard failure the moment a real fix lands. The
-	// base case WITHOUT the modify (XD1/XD3/XD5/XD6) already composes correctly with no duplicate.
-	it.fails("XD2: local renames OUTER dir + MODIFIES the nested file, remote renames INNER dir → the edit survives (no BUG-A loss)", async () => {
+	// #10 (FIXED) — a cross-side nested dir-rename where the file is ALSO modified on the renaming side. This
+	// previously left a permanent DUPLICATE: the modified edit stranded at the pre-inner-rename path AND a copy
+	// at the composed path. Root cause: the remote inner rename was dropped at DETECTION because its local-source
+	// lookup used the pre-outer-rename path and missed (the local outer rename had already moved it), so the move
+	// decomposed into delete+add and the local modify preserved the old path. The rename passes now rebase their
+	// cross-side source lookup (and the emitted from/to) across the OTHER side's directory renames, and the base
+	// tree is rebased off the base-path `from`, so both renames compose to /top2/mid2 with the modified bytes and
+	// no lingering pre-rename path. The base case WITHOUT the modify is XD1/XD3/XD5/XD6.
+	it("XD2: local renames OUTER dir + MODIFIES the nested file, remote renames INNER dir → the edit survives (no BUG-A loss)", async () => {
 		const result = await runScenario({
 			name: "XD2",
 			mode: "twoWay",
@@ -130,8 +127,10 @@ describe("Category XD — cross-side nested directory renames (different levels)
 		expect(result.finalLocal["/top2/mid2/file.txt"]!.contentHash).toBe(result.finalRemote["/top2/mid2/file.txt"]!.contentHash)
 	})
 
-	// KNOWN LIMITATION (#10) — the symmetric expected-failure of XD2 (see its comment). Pinned under it.fails.
-	it.fails("XD4: remote renames OUTER dir + MODIFIES the nested file, local renames INNER dir → the edit survives", async () => {
+	// #10 (FIXED) — the symmetric case of XD2 (see its comment): remote renames the OUTER dir, local renames the
+	// INNER dir. The pass-1 (local-rename) source lookup rebases across the remote's own directory renames to
+	// compose both renames.
+	it("XD4: remote renames OUTER dir + MODIFIES the nested file, local renames INNER dir → the edit survives", async () => {
 		const result = await runScenario({
 			name: "XD4",
 			mode: "twoWay",
@@ -214,6 +213,41 @@ describe("Category XD — cross-side nested directory renames (different levels)
 		expect(result.finalRemote["/top2/keep.txt"]).toMatchObject({ type: "file", size: "K".length })
 		expect(result.finalRemote["/top2/mid2"]).toBeUndefined()
 		expect(result.finalRemote["/top"]).toBeUndefined()
+		expect(result.finalLocal).toEqual(result.finalRemote)
+	})
+
+	it("XD7: composition holds across DEEPER nesting — outer rename + a 3-levels-down inner rename + modify (#10)", async () => {
+		const result = await runScenario({
+			name: "XD7",
+			mode: "twoWay",
+			initialLocal: {
+				"/local/a/b/c/deep.txt": "ORIGINAL",
+				"/local/a/b/keep.txt": "K"
+			},
+			steps: [
+				runCycle(),
+				runCycle(), // settle: base holds /a/b/c/deep.txt + /a/b/keep.txt
+				localMutate(world => {
+					// Rename the OUTER dir /a -> /a2 and modify the file that lives THREE levels down.
+					renameLocal(world, "a", "a2")
+					writeLocalAt(world, "a2/b/c/deep.txt", "MODIFIED-DEEP-LONGER", BASE_TIME + 100 * SECOND)
+				}),
+				// Remote renames the DEEP inner dir /a/b/c -> /a/b/c2 (a different level than the local rename).
+				remoteMutate(world => world.cloud.controls.movePath("/a/b/c", "/a/b/c2")),
+				runCycle(),
+				runCycle(),
+				runCycle()
+			]
+		})
+
+		// Both renames compose across the two intermediate levels: the modified file lands at /a2/b/c2/deep.txt
+		// with the new bytes, and neither pre-rename position lingers.
+		expect(result.finalRemote["/a2/b/c2/deep.txt"]).toMatchObject({ type: "file", size: "MODIFIED-DEEP-LONGER".length })
+		expect(result.finalRemote["/a2/b/keep.txt"]).toMatchObject({ type: "file", size: "K".length })
+		expect(result.finalRemote["/a2/b/c/deep.txt"]).toBeUndefined()
+		expect(result.finalRemote["/a2/b/c"]).toBeUndefined()
+		expect(result.finalRemote["/a"]).toBeUndefined()
+		expect(result.finalRemote["/a2/b/c2/deep.txt"]!.contentHash).toBe(result.finalLocal["/a2/b/c2/deep.txt"]!.contentHash)
 		expect(result.finalLocal).toEqual(result.finalRemote)
 	})
 })
