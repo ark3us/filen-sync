@@ -228,17 +228,24 @@ describe("Category N — utils.isPathOverMaxLength / isNameOverMaxLength", () =>
 		})
 	})
 
-	it("uses a 512 path limit on win32", () => {
+	// Windows: the long-path ceiling is 32767 UTF-16 units (incl. the NUL). Node/libuv auto-prepends the
+	// `\\?\` namespace prefix for absolute paths, so fs ops handle paths far beyond the legacy 260 MAX_PATH
+	// regardless of the app manifest or registry. The previous 512 was a conservative guess that SILENTLY
+	// dropped syncable deep paths (never synced, reported only as "ignored") — the "how deep can it sync /
+	// 150GB missing" reports. The cap must reject only what Windows fundamentally cannot represent.
+	it("uses the 32767 long-path limit on win32 (not the legacy 260/512)", () => {
 		withPlatform("win32", () => {
-			expect(isPathOverMaxLength("a".repeat(511))).toBe(false)
-			expect(isPathOverMaxLength("a".repeat(512))).toBe(true)
+			expect(isPathOverMaxLength("a".repeat(600))).toBe(false) // was wrongly dropped at the 512 cap
+			expect(isPathOverMaxLength("a".repeat(32766))).toBe(false)
+			expect(isPathOverMaxLength("a".repeat(32767))).toBe(true)
 		})
 	})
 
-	it("falls back to a 512 path limit on an unknown platform", () => {
+	it("falls back to a generous 4096 path limit on an unknown platform (never silently drop a syncable path)", () => {
 		withPlatform("freebsd", () => {
-			expect(isPathOverMaxLength("a".repeat(511))).toBe(false)
-			expect(isPathOverMaxLength("a".repeat(512))).toBe(true)
+			expect(isPathOverMaxLength("a".repeat(600))).toBe(false)
+			expect(isPathOverMaxLength("a".repeat(4095))).toBe(false)
+			expect(isPathOverMaxLength("a".repeat(4096))).toBe(true)
 		})
 	})
 

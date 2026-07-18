@@ -108,11 +108,18 @@ export function isPathOverMaxLength(path: string): boolean {
 		// ENAMETOOLONG), so the full path is measured in UTF-8 bytes — unlike the NAME limit below.
 		return Buffer.byteLength(path, "utf8") + 1 > 1024
 	} else if (process.platform === "win32") {
-		// Windows paths are counted in UTF-16 code units (WCHAR), which is exactly String.length.
-		return path.length + 1 > 512
+		// Windows paths are counted in UTF-16 code units (WCHAR), which is exactly String.length. The ceiling
+		// is the EXTENDED-length limit of 32767 WCHAR (incl. the NUL), NOT the legacy 260 MAX_PATH: Node/libuv
+		// auto-prepends the `\\?\` namespace prefix for absolute paths, so fs ops handle long paths regardless
+		// of the app manifest or the LongPathsEnabled registry flag. A lower guess (this was 512) SILENTLY drops
+		// syncable deep paths — they never sync, surfacing only as "ignored: pathLength" — the "how deep can it
+		// sync / files missing" reports. Reject only what Windows fundamentally cannot represent.
+		return path.length + 1 > 32767
 	}
 
-	return Buffer.byteLength(path, "utf8") + 1 > 512
+	// Unknown platform: a generous 4096-byte ceiling (matching Linux PATH_MAX) rather than a conservative guess,
+	// so an unrecognized OS never silently drops a path its filesystem would accept.
+	return Buffer.byteLength(path, "utf8") + 1 > 4096
 }
 
 export function isNameOverMaxLength(name: string): boolean {

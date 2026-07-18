@@ -11,7 +11,8 @@ import { type SyncMessage } from "../../src/types"
  * each of which reads `process.platform` at call time. The rule:
  *
  *   - win32  → forbids `< > : " | ? *`, control chars, the reserved device names (CON/PRN/AUX/NUL/
- *              COM1-9/LPT1-9, with or without an extension), and paths over 512 chars.
+ *              COM1-9/LPT1-9, with or without an extension), and paths over the 32767-WCHAR long-path
+ *              ceiling (NOT the legacy 260/512 — Node/libuv handles long paths via the `\\?\` prefix).
  *   - darwin → forbids `:` and NUL; paths over 1024 chars.
  *   - linux  → forbids only NUL; paths over 4096 chars.
  *
@@ -44,13 +45,18 @@ function ignoredReasons(messages: SyncMessage[]): string[] {
 	return [...local, ...remote]
 }
 
-// A path long enough that its absolute local form (prefixed with "/local") exceeds Windows' 512-char
-// limit, but every individual NAME stays under the uniform 255-char name limit (so only `pathLength`,
-// not `nameLength`, is exercised). 6 + 1 + 200 + 1 + 200 + 1 + 154 = 563 chars absolute.
+// A ~563-char absolute path: over the OLD (buggy) 512 win32 cap, but comfortably under macOS 1024 and Linux
+// 4096 — and now under the corrected win32 32767 ceiling too. Every NAME stays under the 255-char limit, so
+// only `pathLength` (never `nameLength`) is at play.
 const LONG_DIR = "d".repeat(200)
 const LONG_SUB = "s".repeat(200)
 const LONG_LEAF = `${"f".repeat(150)}.txt`
 const LONG_PATH = `/${LONG_DIR}/${LONG_SUB}/${LONG_LEAF}`
+
+// A path whose absolute form genuinely exceeds the 32767-WCHAR win32 long-path ceiling — the only length a
+// win32 client truly cannot represent. Built from 255-char segments (each within the NAME limit) so only
+// `pathLength` fires. 140 × (255 + 1) ≈ 35840 chars.
+const WIN32_TOO_LONG = `/${Array.from({ length: 140 }, () => "x".repeat(255)).join("/")}/leaf.txt`
 
 describe("Category AC — cross-platform path rules", () => {
 	it("AC1: win32 skips a remote file with a colon (invalidPath), syncs valid siblings, never deletes it", async () => {
@@ -206,21 +212,26 @@ describe("Category AC — cross-platform path rules", () => {
 		expect(ignoredReasons(result.messages)).toContain("invalidPath")
 	})
 
-	it("AC8: win32 skips a remote path over its 512-char limit (pathLength); a short sibling syncs", async () => {
+	it("AC8: win32 SYNCS a ~563-char path (regression: not dropped at the old 512 cap) but skips one over 32767", async () => {
 		const result = await withPlatform("win32", () =>
 			runScenario({
 				name: "AC8",
 				mode: "cloudToLocal",
 				initialRemote: {
-					[LONG_PATH]: "too long for windows",
+					[LONG_PATH]: "fine on modern windows",
+					[WIN32_TOO_LONG]: "genuinely unrepresentable",
 					"/short.txt": "fine"
 				},
 				steps: [runCycle(), runCycle()]
 			})
 		)
 
-		expect(result.finalLocal[LONG_PATH]).toBeUndefined()
+		// The ~563-char path now downloads (Node handles long paths via `\\?\`); the old 512 cap silently
+		// dropped it — the "how deep can it sync / files missing" regression.
+		expect(result.finalLocal[LONG_PATH]).toMatchObject({ type: "file" })
 		expect(result.finalLocal["/short.txt"]).toMatchObject({ type: "file" })
+		// A path over the true 32767 ceiling is still skipped (pathLength) — a graceful skip, not a crash.
+		expect(result.finalLocal[WIN32_TOO_LONG]).toBeUndefined()
 		expect(ignoredReasons(result.messages)).toContain("pathLength")
 	})
 
