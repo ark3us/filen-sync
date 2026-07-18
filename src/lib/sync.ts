@@ -695,7 +695,14 @@ export class Sync {
 
 						this.taskErrors = errors
 
-						if (this.taskErrors.length === 0) {
+						// Advance the base + persist state ONLY when the cycle finished cleanly and was NOT paused/
+						// removed mid-processing. When paused, processTask SKIPPED the remaining tasks so this cycle
+						// could return and release the account lock; advancing the base here would fold the skipped
+						// work into it as already-synced (a pending upload would never fire again). Leaving the base
+						// untouched makes the next cycle after resume re-fetch fresh trees and redo exactly the
+						// outstanding work — the completed tasks are reflected in those fresh trees, so nothing is
+						// re-done wrongly and nothing is lost (skip-and-restart, like the deletion-confirmation gate).
+						if (this.taskErrors.length === 0 && !this.paused && !this.removed) {
 							if (doneTasks.length > 0) {
 								postMessageToMain({
 									type: "cycleApplyingStateStarted",

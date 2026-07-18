@@ -111,22 +111,6 @@ export class Tasks {
 		this.sync = sync
 	}
 
-	public async waitForPause(): Promise<void> {
-		if (!this.sync.paused || this.sync.removed) {
-			return
-		}
-
-		await new Promise<void>(resolve => {
-			const wait = setInterval(() => {
-				if (!this.sync.paused || this.sync.removed) {
-					clearInterval(wait)
-
-					resolve()
-				}
-			}, 100)
-		})
-	}
-
 	/**
 	 * Process a delta task.
 	 *
@@ -136,9 +120,13 @@ export class Tasks {
 	 * @returns {Promise<DoneTask | null>}
 	 */
 	private async processTask(delta: Delta): Promise<DoneTask | null> {
-		await this.waitForPause()
-
-		if (this.sync.removed) {
+		// Skip (do NOT block) when paused or removed. This gate used to BLOCK every not-yet-started task until
+		// resume (waitForPause) — but it runs INSIDE the cycle, which holds the auto-refreshing account lock, so
+		// the entire account was starved (no other device could sync) for the whole pause. Skipping instead lets
+		// process() return so the cycle's finally releases the lock; the skipped work is recomputed and redone on
+		// the next cycle after resume, and the cycle declines to advance its base when it ends paused so nothing
+		// is forgotten. Mirrors the deletion-confirmation gate's paused/removed bail. (#8)
+		if (this.sync.paused || this.sync.removed) {
 			return null
 		}
 

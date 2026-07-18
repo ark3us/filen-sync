@@ -55,6 +55,46 @@ describe.skipIf(!E2E_ENABLED)("E2E — lifecycle & control surface", () => {
 		})
 	})
 
+	it("pausing MID-cycle releases the account lock and the skipped work is redone on resume (Fix #8)", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
+			await writeLocal(world, "seed.txt", "s")
+			await settle(world)
+			await expectConverged(world)
+
+			// Queue real upload work, then start a cycle and pause it BEFORE its task phase. runCycle() runs
+			// synchronously past the pre-cycle pause check (which passed) and only yields at its first await, so
+			// pausing now makes the task phase skip its work — no transfer starts, so nothing holds the lock.
+			await writeLocal(world, "new1.txt", "a")
+			await writeLocal(world, "new2.txt", "b")
+
+			world.worker.resetCache(world.syncPair.uuid)
+
+			const cyclePromise = world.sync.runCycle()
+
+			world.worker.updatePaused(world.syncPair.uuid, true)
+
+			// The paused cycle must RESOLVE (release the lock). Before the fix its tasks block until resume and
+			// the cycle — holding the auto-refreshing account lock — never returns.
+			const released = await Promise.race([
+				cyclePromise.then(() => true),
+				new Promise<boolean>(resolve => setTimeout(() => resolve(false), 20_000))
+			])
+
+			expect(released, "the paused cycle held the account lock and never released it").toBe(true)
+
+			// Resume: the skipped uploads are redone (the base was not advanced past them) and converge.
+			world.worker.updatePaused(world.syncPair.uuid, false)
+			await settle(world)
+			await expectConverged(world)
+
+			const remote = await snapshotRemoteReal(world)
+
+			expect(remote["/new1.txt"], "the skipped upload was forgotten after resume").toMatchObject({ type: "file" })
+			expect(remote["/new2.txt"]).toMatchObject({ type: "file" })
+			expect(remote["/seed.txt"]).toMatchObject({ type: "file" })
+		})
+	})
+
 	it("updateMode mid-run switches behavior on the next cycle: twoWay -> localBackup stops deletions (I6)", async () => {
 		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
 			await writeLocal(world, "a.txt", "a")
