@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest"
 import type FilenSDK from "@filen/sdk"
 import { E2E_ENABLED, loginTestSDK, teardownTestSDK } from "./harness/account"
 import { withE2EWorld, type E2EWorld } from "./harness/world"
-import { settle, messagesOfType } from "./harness/drive"
+import { settle, cycle, messagesOfType } from "./harness/drive"
 import { snapshotRemoteReal, snapshotLocalReal } from "./harness/assert"
 import { writeLocal, rmLocal, uploadRemote, deleteRemote } from "./harness/mutations"
 
@@ -87,6 +87,72 @@ describe.skipIf(!E2E_ENABLED)("E2E — large-deletion confirmation", () => {
 
 			expect(remote["/x.txt"]).toMatchObject({ type: "file" })
 			expect(remote["/y.txt"]).toMatchObject({ type: "file" })
+		})
+	})
+
+	it("an engine-seeded remote base (upload-only) still arms the gate when the remote is emptied (Fix #4, where: remote)", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay", requireConfirmationOnLargeDeletion: true }, async world => {
+			await writeLocal(world, "a.txt", "a")
+			await writeLocal(world, "b.txt", "b")
+
+			// EXACTLY ONE upload cycle seeds the remote base from the engine's own transfers. Do NOT settle: a
+			// second fresh re-read would rebuild the remote tree with an accurate size and mask the bug — the
+			// staleness only exists in the base snapshotted right after the transfers mutated the live tree.
+			await cycle(world)
+
+			const seeded = await snapshotRemoteReal(world)
+
+			expect(seeded["/a.txt"], "precondition: the upload cycle must seed the remote").toMatchObject({ type: "file" })
+			expect(seeded["/b.txt"]).toMatchObject({ type: "file" })
+
+			// A peer trashes the whole remote.
+			await deleteRemote(world, "a.txt")
+			await deleteRemote(world, "b.txt")
+
+			// Without the fix the engine-seeded base carries size 0, so the gate is bypassed and the local files
+			// are deleted silently. With it the prompt fires and (restart) the local backup survives.
+			await runCycleWithDecision(world, "restart")
+
+			const prompts = messagesOfType(world.messages, "confirmDeletion")
+
+			expect(prompts.length, "the engine-seeded remote base did not arm the gate").toBeGreaterThan(0)
+			expect(prompts[0]!.data.where).toBe("remote")
+
+			const local = await snapshotLocalReal(world)
+
+			expect(local["/a.txt"]).toMatchObject({ type: "file" })
+			expect(local["/b.txt"]).toMatchObject({ type: "file" })
+		})
+	})
+
+	it("an engine-seeded local base (download-only) still arms the gate when the local side is emptied (Fix #4, where: local)", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay", requireConfirmationOnLargeDeletion: true }, async world => {
+			await uploadRemote(world, "a.txt", "a")
+			await uploadRemote(world, "b.txt", "b")
+
+			// EXACTLY ONE download cycle seeds the LOCAL base from the engine's own transfers (see above).
+			await cycle(world)
+
+			const seeded = await snapshotLocalReal(world)
+
+			expect(seeded["/a.txt"], "precondition: the download cycle must seed the local side").toMatchObject({ type: "file" })
+			expect(seeded["/b.txt"]).toMatchObject({ type: "file" })
+
+			// The local side is wiped (e.g. the drive vanished).
+			await rmLocal(world, "a.txt")
+			await rmLocal(world, "b.txt")
+
+			await runCycleWithDecision(world, "restart")
+
+			const prompts = messagesOfType(world.messages, "confirmDeletion")
+
+			expect(prompts.length, "the engine-seeded local base did not arm the gate").toBeGreaterThan(0)
+			expect(prompts[0]!.data.where).toBe("local")
+
+			const remote = await snapshotRemoteReal(world)
+
+			expect(remote["/a.txt"]).toMatchObject({ type: "file" })
+			expect(remote["/b.txt"]).toMatchObject({ type: "file" })
 		})
 	})
 

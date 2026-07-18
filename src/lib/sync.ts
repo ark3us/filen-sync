@@ -775,15 +775,25 @@ export class Sync {
 							// base's items are immutable once snapshotted. A full structuredClone instead deep-copied
 							// every item on every change-cycle — O(tree) CPU plus a second full copy of the tree in
 							// memory — for isolation a shallow map copy already provides. (P3)
+							// Derive `size` from the snapshotted tree, NOT from result.size. A cycle's transfer handlers
+							// add/remove entries in the live tree cache's `.tree` in place but never touch its `.size`,
+							// so result.size is a STALE primitive that disagrees with the tree after any upload/download/
+							// delete. A stale 0 would defeat the large-deletion confirmation gate's `previousTree.size > 0`
+							// guard in the universal first-sync case (an engine-seeded base). This matches exactly how
+							// state.ts recomputes the size on RELOAD (Object.keys(tree).length), so the in-process base and
+							// a restarted one agree. O(N) over an already-O(N) shallow map copy — negligible, once per cycle.
+							const localTreeSnapshot = { ...currentLocalTree.result.tree }
+							const remoteTreeSnapshot = { ...currentRemoteTree.result.tree }
+
 							this.previousLocalTree = {
-								tree: { ...currentLocalTree.result.tree },
+								tree: localTreeSnapshot,
 								inodes: { ...currentLocalTree.result.inodes },
-								size: currentLocalTree.result.size
+								size: Object.keys(localTreeSnapshot).length
 							}
 							this.previousRemoteTree = {
-								tree: { ...currentRemoteTree.result.tree },
+								tree: remoteTreeSnapshot,
 								uuids: { ...currentRemoteTree.result.uuids },
-								size: currentRemoteTree.result.size
+								size: Object.keys(remoteTreeSnapshot).length
 							}
 
 							await this.state.save()
