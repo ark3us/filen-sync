@@ -41,19 +41,24 @@ function inject(world: World, folders: Folder[], files: File[]): void {
  * a microtask, so within a batch every decrypt in that batch increments before any decrements: peak === batch
  * width.
  */
+type DecryptArgs = { metadata: string; key?: string }
+type DecryptFn = (args: DecryptArgs) => Promise<unknown>
+// Minimal structural view of just the SDK crypto surface this instrument wraps (the metadata decryptors the
+// tree build calls). The rest of the crypto object is carried through untouched by the spread below.
+type DecryptSurface = { fileMetadata: DecryptFn; folderMetadata: DecryptFn }
+type CryptoSurface = { decrypt: () => DecryptSurface }
+type SdkCryptoHandle = { crypto: () => CryptoSurface }
+
 function instrumentDecryptConcurrency(world: World): { peak: () => number; calls: () => number } {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const sdk = world.sync.sdk as any
+	const sdk = world.sync.sdk as unknown as SdkCryptoHandle
 	const origCrypto = sdk.crypto.bind(sdk)
 	let inFlight = 0
 	let peak = 0
 	let calls = 0
 
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const wrap =
-		(fn: (args: any) => Promise<any>) =>
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		async (args: any): Promise<any> => {
+		(fn: DecryptFn): DecryptFn =>
+		async (args: DecryptArgs): Promise<unknown> => {
 			inFlight++
 			calls++
 
