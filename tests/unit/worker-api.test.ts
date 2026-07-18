@@ -53,6 +53,31 @@ async function withPlatformAsync(platform: NodeJS.Platform, fn: () => Promise<vo
 	}
 }
 
+describe("Sync.initialize — offline pair admission (#14)", () => {
+	it("initialize() resolves bounded when the local path is offline (does not wedge updateSyncPairs)", async () => {
+		await withWorld({ mode: "twoWay" }, async world => {
+			// Model an offline drive: the local smoke test can never pass.
+			world.sync.localFileSystem.isPathWritable = async () => false
+			world.sync.localFileSystem.isPathReadable = async () => false
+
+			// A fresh initialize() must ADMIT the pair (resolve) rather than block on the unbounded startup
+			// smoke-test retry. That block ran inside updateSyncPairs' mutex, stalling worker init AND every later
+			// updateSyncPairs. With the fix this resolves via state+ignorer (fs promises settle on the real
+			// microtask queue even under fake timers); WITHOUT it, initialize awaits the smoke-test retry — a FAKED
+			// setTimeout that never fires — so this await never returns and the test times out (the wedge).
+			await world.sync.initialize()
+
+			// The pair is admitted; run()'s own per-cycle smoke test now gates the work until the path returns.
+			await vi.advanceTimersByTimeAsync(1)
+
+			expect(
+				world.messages.some(message => message.type === "cycleLocalSmokeTestFailed"),
+				"the admitted pair's cycle loop did not reach its own smoke-test gate"
+			).toBe(true)
+		})
+	})
+})
+
 describe("SyncWorker public API — constructor", () => {
 	it("throws when neither an sdk instance nor an sdkConfig is provided", () => {
 		expect(() => new SyncWorker({ syncPairs: [], dbPath: DB_ROOT })).toThrow(

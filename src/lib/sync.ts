@@ -224,8 +224,13 @@ export class Sync {
 		this.isInitialized = true
 
 		try {
-			await this.smokeTest()
-
+			// Do NOT block on the startup smoke test here. It retries every SYNC_INTERVAL until the local/remote
+			// path is reachable — unbounded for an offline drive — and initialize() runs inside updateSyncPairs'
+			// mutex, so one offline pair used to stall worker init AND every later updateSyncPairs (the mutex was
+			// never released). State + ignorer init are path-independent for the common offline cases (state lives
+			// in the app db dir; the ignorer degrades to its stored copy when the physical .filenignore is
+			// unreachable), and run()'s OWN per-cycle smoke test (runCycle) still gates all real work until the
+			// path returns. So admit the pair immediately and let the cycle loop wait for availability. (#14)
 			await Promise.all([this.state.initialize(), this.ignorer.initialize()])
 
 			this.worker.logger.log("info", "Initialized", this.syncPair.localPath)
