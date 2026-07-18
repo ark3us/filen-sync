@@ -26,10 +26,13 @@ import { uploadRemote, writeLocal } from "./harness/mutations"
 describe.skipIf(!E2E_ENABLED)("E2E — cross-platform path rules", () => {
 	let sdk: FilenSDK
 
-	// A path long enough to exceed win32's 512-char limit on its own (so the tmp-dir prefix is
-	// irrelevant) while staying under darwin's 1024 limit once prefixed; every NAME is ≤ 255 (the
-	// uniform name limit) so only `pathLength`, not `nameLength`, is in play.
-	const longPath = `/${"d".repeat(250)}/${"s".repeat(250)}/${"f".repeat(240)}.txt`
+	// A path long enough to exceed darwin's 1024-BYTE PATH_MAX on its own (so the tmp-dir prefix is
+	// irrelevant) while staying well under linux's 4096-byte PATH_MAX and win32's 32767-WCHAR extended-length
+	// ceiling (Node/libuv auto-prepends `\\?\`). macOS is now the strictest total-path platform, so this is
+	// skipped only there. Every NAME is ≤ 255 (the uniform name limit) so only `pathLength`, not `nameLength`,
+	// is in play. The per-platform `isPathOverMaxLength` boundary itself — incl. win32's 32767 cap — is unit-
+	// tested in tests/unit/n-unit.test.ts; this e2e proves the real download/skip pipeline on the host OS.
+	const longPath = `/${"d".repeat(238)}/${"d".repeat(238)}/${"d".repeat(238)}/${"d".repeat(238)}/${"d".repeat(238)}/${"f".repeat(234)}.txt`
 
 	beforeAll(async () => {
 		sdk = await loginTestSDK()
@@ -89,9 +92,9 @@ describe.skipIf(!E2E_ENABLED)("E2E — cross-platform path rules", () => {
 		})
 	})
 
-	it("a path over the win32 length limit syncs down on darwin/linux but is skipped on win32", async () => {
+	it("a path over macOS's PATH_MAX (but under the linux/win32 limits) is skipped only on darwin", async () => {
 		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
-			await uploadRemote(world, longPath, "long path — over 512 chars")
+			await uploadRemote(world, longPath, "a deep path — over darwin's 1024, under linux 4096 and win32 32767")
 			await uploadRemote(world, "short.txt", "fine everywhere")
 			await settle(world)
 
@@ -100,9 +103,12 @@ describe.skipIf(!E2E_ENABLED)("E2E — cross-platform path rules", () => {
 			expect(remote[longPath]).toMatchObject({ type: "file" })
 			expect(local["/short.txt"]).toMatchObject({ type: "file" })
 
-			if (process.platform === "win32") {
+			if (process.platform === "darwin") {
+				// Over macOS's 1024-byte PATH_MAX → the download is skipped (surfaces as ignored: pathLength).
 				expect(local[longPath]).toBeUndefined()
 			} else {
+				// Under linux's 4096-byte PATH_MAX and win32's 32767-WCHAR ceiling → it syncs down. On win32 this
+				// exercises the long-path handling (Node/libuv `\\?\` prefixing) that the raised cap relies on.
 				expect(local[longPath]).toMatchObject({ type: "file" })
 			}
 		})
