@@ -2,9 +2,9 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest"
 import type FilenSDK from "@filen/sdk"
 import { E2E_ENABLED, loginTestSDK, teardownTestSDK } from "./harness/account"
 import { withE2EWorld } from "./harness/world"
-import { settle } from "./harness/drive"
+import { settle, cycle } from "./harness/drive"
 import { snapshotRemoteReal } from "./harness/assert"
-import { writeLocal, modifyLocal, existsLocal } from "./harness/mutations"
+import { writeLocal, modifyLocal, rmLocal, existsLocal } from "./harness/mutations"
 
 /**
  * Phase 3 e2e — .filenignore + dotfile filtering against the live backend. Ignored paths must never
@@ -118,6 +118,37 @@ describe.skipIf(!E2E_ENABLED)("E2E — ignore filtering", () => {
 			// The remote copy survives and the local file is untouched — ignore is not deletion.
 			expect((await snapshotRemoteReal(world))["/keep-me.txt"]).toMatchObject({ type: "file" })
 			expect(await existsLocal(world, "keep-me.txt")).toBe(true)
+		})
+	})
+
+	it("a dir-only rule does not ignore a same-named FILE that replaces the ignored directory (Fix #7)", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay", filenIgnore: "build/\n" }, async world => {
+			await writeLocal(world, "build/artifact.o", "obj")
+			await writeLocal(world, "keep.txt", "k")
+			await settle(world)
+
+			// The build/ directory is ignored; keep.txt syncs.
+			const afterDir = await snapshotRemoteReal(world)
+
+			expect(afterDir["/build"]).toBeUndefined()
+			expect(afterDir["/keep.txt"]).toMatchObject({ type: "file" })
+
+			// Replace the ignored directory with a same-named FILE. The dir-only rule does NOT ignore a file, so
+			// it must sync. Force a rescan WITHOUT resetCache so the ignore cache PERSISTS across the change (as
+			// it does in a long-running worker) — that is exactly the condition a path-only cache key got wrong.
+			await rmLocal(world, "build")
+			await writeLocal(world, "build", "i-am-now-a-file")
+
+			world.sync.localFileSystem.getDirectoryTreeCache.timestamp = 0
+			world.sync.localFileSystem.lastDirectoryChangeTimestamp = Date.now()
+
+			await cycle(world, { resetCache: false })
+			await settle(world, { resetCache: false })
+
+			const afterFile = await snapshotRemoteReal(world)
+
+			expect(afterFile["/build"], "the same-named file was dropped by the stale dir verdict").toMatchObject({ type: "file" })
+			expect(afterFile["/build/artifact.o"]).toBeUndefined()
 		})
 	})
 

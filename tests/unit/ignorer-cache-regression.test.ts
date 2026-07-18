@@ -13,15 +13,16 @@ describe("Ignorer — ignoredCache preservation across unchanged re-init (perf g
 	it("keeps the filesystem ignoredCache populated when re-init finds unchanged rules", async () => {
 		const world = await createWorld({ mode: "twoWay", filenIgnore: "*.log" })
 
-		// Populate the local FS ignore cache for a path.
+		// Populate the local FS ignore cache for a path. The cache is keyed by path AND type (Fix #7), so the
+		// key for this file lookup is "/keep.txt:file".
 		world.sync.localFileSystem.isPathIgnored("/keep.txt", "/local/keep.txt", "file")
 
-		expect(world.sync.localFileSystem.ignoredCache.has("/keep.txt")).toBe(true)
+		expect(world.sync.localFileSystem.ignoredCache.has("/keep.txt:file")).toBe(true)
 
 		// The per-cycle re-init path (no passed content) with identical rules must leave the cache intact.
 		await world.sync.ignorer.initialize()
 
-		expect(world.sync.localFileSystem.ignoredCache.has("/keep.txt")).toBe(true)
+		expect(world.sync.localFileSystem.ignoredCache.has("/keep.txt:file")).toBe(true)
 		expect(world.sync.remoteFileSystem.ignoredCache).toBeDefined()
 	})
 
@@ -30,13 +31,13 @@ describe("Ignorer — ignoredCache preservation across unchanged re-init (perf g
 
 		world.sync.localFileSystem.isPathIgnored("/a.txt", "/local/a.txt", "file")
 
-		expect(world.sync.localFileSystem.ignoredCache.has("/a.txt")).toBe(true)
+		expect(world.sync.localFileSystem.ignoredCache.has("/a.txt:file")).toBe(true)
 		expect(world.sync.ignorer.ignores("a.txt")).toBe(false)
 
 		await world.sync.ignorer.update("*.txt")
 
 		// The cache was wiped (re-evaluation forced) and the new rule now applies.
-		expect(world.sync.localFileSystem.ignoredCache.has("/a.txt")).toBe(false)
+		expect(world.sync.localFileSystem.ignoredCache.has("/a.txt:file")).toBe(false)
 		expect(world.sync.ignorer.ignores("a.txt")).toBe(true)
 	})
 

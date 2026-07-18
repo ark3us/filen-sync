@@ -190,16 +190,21 @@ export class LocalFileSystem {
 		absolutePath: string,
 		type: "file" | "directory"
 	): { ignored: true; reason: LocalTreeIgnoredReason } | { ignored: false } {
+		// Key the cache by path AND type: the .filenignore verdict is type-dependent (a dir-only rule like
+		// `build/` ignores `build` as a DIRECTORY but not as a FILE), so a bare-path key returned the stale
+		// directory verdict after a `build` dir was replaced by a same-named file — the file was then silently
+		// never backed up for the whole session (re-opened BUG-005). Matches remote.ts's `path + ":" + type`.
+		const key = relativePath + ":" + type
 		// One cache lookup, not two — this runs per file on every scan (a cache hit for every unchanged
 		// path now that the cache survives a cycle), so the second redundant get() was pure overhead.
-		const cached = this.ignoredCache.get(relativePath)
+		const cached = this.ignoredCache.get(key)
 
 		if (cached) {
 			return cached
 		}
 
 		if (isPathOverMaxLength(absolutePath)) {
-			this.ignoredCache.set(relativePath, {
+			this.ignoredCache.set(key, {
 				ignored: true,
 				reason: "pathLength"
 			})
@@ -211,7 +216,7 @@ export class LocalFileSystem {
 		}
 
 		if (isNameOverMaxLength(pathModule.basename(absolutePath))) {
-			this.ignoredCache.set(relativePath, {
+			this.ignoredCache.set(key, {
 				ignored: true,
 				reason: "nameLength"
 			})
@@ -223,7 +228,7 @@ export class LocalFileSystem {
 		}
 
 		if (!isValidPath(absolutePath)) {
-			this.ignoredCache.set(relativePath, {
+			this.ignoredCache.set(key, {
 				ignored: true,
 				reason: "invalidPath"
 			})
@@ -235,7 +240,7 @@ export class LocalFileSystem {
 		}
 
 		if (isRelativePathIgnoredByDefault(relativePath) || isAbsolutePathIgnoredByDefault(absolutePath)) {
-			this.ignoredCache.set(relativePath, {
+			this.ignoredCache.set(key, {
 				ignored: true,
 				reason: "defaultIgnore"
 			})
@@ -249,7 +254,7 @@ export class LocalFileSystem {
 		// The root .filenignore is exempt from the dotfile filter so the shared ignore-config syncs even when
 		// excludeDotFiles is on; an explicit .filenignore rule below can still exclude it. (see isSyncedIgnoreFile)
 		if (this.sync.excludeDotFiles && pathIncludesDotFile(relativePath) && !isSyncedIgnoreFile(relativePath)) {
-			this.ignoredCache.set(relativePath, {
+			this.ignoredCache.set(key, {
 				ignored: true,
 				reason: "dotFile"
 			})
@@ -263,7 +268,7 @@ export class LocalFileSystem {
 		const trailingSlash = type === "directory" ? "/" : ""
 
 		if (this.sync.ignorer.ignores(relativePath + trailingSlash)) {
-			this.ignoredCache.set(relativePath, {
+			this.ignoredCache.set(key, {
 				ignored: true,
 				reason: "filenIgnore"
 			})
@@ -274,7 +279,7 @@ export class LocalFileSystem {
 			}
 		}
 
-		this.ignoredCache.set(relativePath, {
+		this.ignoredCache.set(key, {
 			ignored: false
 		})
 
