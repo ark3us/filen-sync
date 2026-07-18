@@ -144,6 +144,13 @@ export type CreateVirtualFSOptions = {
 	 * clock does not. Exercises the engine's whole-second mtime normalization against non-integer inputs.
 	 */
 	fractionalMtime?: boolean
+	/**
+	 * Model a volume that cannot report a file creation/birth time. SMB/CIFS, tmpfs and old ext4 return
+	 * `birthtimeMs: 0` for every entry — memfs always hands out a real birthtime, so the engine's birthtime-based
+	 * inode-reuse rename guard (F8) is never exercised against this reality without it. `"zero"` forces every
+	 * stat/lstat to report `birthtimeMs: 0` (→ the local item's `creation` becomes 0).
+	 */
+	birthtimeMode?: "stable" | "zero"
 }
 
 /**
@@ -159,6 +166,7 @@ export function createVirtualFS(initial: VfsSpec = {}, options: CreateVirtualFSO
 	const caseInsensitive = options.caseInsensitive ?? false
 	const inodeMode = options.inodeMode ?? "stable"
 	const fractionalMtime = options.fractionalMtime ?? false
+	const birthtimeMode = options.birthtimeMode ?? "stable"
 
 	applyVfsSpec(ifs, initial)
 
@@ -234,7 +242,7 @@ export function createVirtualFS(initial: VfsSpec = {}, options: CreateVirtualFSO
 	// Apply the configured volume traits to a raw memfs Stats: inode model (SMB `ino: 0`), a per-path inode
 	// override (ext4-reuse tests), and a fractional-mtime component (real-fs sub-ms precision). Mutates and
 	// returns the same Stats object.
-	type MutableStats = { ino: number; mtimeMs: number; mtime: Date }
+	type MutableStats = { ino: number; mtimeMs: number; mtime: Date; birthtimeMs: number; birthtime: Date }
 	const applyStatTraits = (stats: MutableStats, path: string): MutableStats => {
 		if (inodeMode === "zero") {
 			stats.ino = 0
@@ -244,6 +252,11 @@ export function createVirtualFS(initial: VfsSpec = {}, options: CreateVirtualFSO
 
 		if (overriddenInode !== undefined) {
 			stats.ino = overriddenInode
+		}
+
+		if (birthtimeMode === "zero" && stats.birthtimeMs !== 0) {
+			stats.birthtimeMs = 0
+			stats.birthtime = new Date(0)
 		}
 
 		let mtimeMs = stats.mtimeMs

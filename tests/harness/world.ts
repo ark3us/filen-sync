@@ -31,6 +31,8 @@ export type CreateWorldOptions = {
 	inodeMode?: "stable" | "zero"
 	/** Add a deterministic sub-ms fraction to reported mtimes (real-fs precision memfs lacks). */
 	fractionalMtime?: boolean
+	/** Model a volume that reports `birthtimeMs: 0` for every file (SMB/CIFS/tmpfs/old ext4). */
+	birthtimeMode?: "stable" | "zero"
 }
 
 export type World = {
@@ -92,7 +94,8 @@ export async function createWorld(options: CreateWorldOptions): Promise<World> {
 	const vfs = createVirtualFS(localSpec, {
 		caseInsensitive: options.caseInsensitive ?? false,
 		inodeMode: options.inodeMode ?? "stable",
-		fractionalMtime: options.fractionalMtime ?? false
+		fractionalMtime: options.fractionalMtime ?? false,
+		birthtimeMode: options.birthtimeMode ?? "stable"
 	})
 	const cloud = createFakeCloud(options.initialRemote ?? {}, { localFs: vfs.fs })
 	const watcher = createManualWatcher()

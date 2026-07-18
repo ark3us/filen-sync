@@ -1,6 +1,6 @@
 import type Sync from "./sync"
 import { type SyncMode } from "../types"
-import { type LocalTree, type LocalTreeError, type LocalTreeIgnored } from "./filesystems/local"
+import { type LocalTree, type LocalItem, type LocalTreeError, type LocalTreeIgnored } from "./filesystems/local"
 import { type RemoteTree } from "./filesystems/remote"
 import { replacePathStartWithFromAndTo, pathIncludesDotFile, normalizeLastModifiedMsForComparison, isSyncedIgnoreFile } from "../utils"
 
@@ -352,6 +352,51 @@ export function directoryRenameCorroboratedByChild(fromDir: string, toDir: strin
 }
 
 /**
+ * Whether a matching inode across a LOCAL path change is corroborated as a GENUINE rename (vs an ext4-style
+ * inode-reuse coincidence, where "delete a.txt + create c.txt" lands c.txt on a.txt's freed inode). A genuine
+ * rename preserves the file's birthtime; a reused inode belongs to a freshly-created file with a newer one.
+ *
+ * The birthtime signal is unavailable on whole volumes that report `creation` as 0 (SMB/CIFS/tmpfs/old-ext4).
+ * MIRROR modes (twoWay/localToCloud) may still DEGRADE to inode-only there, because a phantom rename
+ * self-heals: the stale source path was going to be deleted anyway, and F1 re-uploads the new content — the
+ * worlds converge. But an ADDITIVE backup (localBackup) NEVER propagates the source deletion, so a phantom
+ * file rename would rename the kept backup out from under the original name and destroy it: permanent, silent
+ * data loss. On a birthtime-0 volume the inode-only degradation gives that mode ZERO protection, so for
+ * localBackup a FILE rename requires a RELIABLE (both non-zero, equal) birthtime, and a DIRECTORY rename
+ * requires surviving-child identity (a reused dir inode has none of the old children). When neither holds the
+ * candidate is left to the delete+add passes, which for an additive backup simply keep the old copy and
+ * upload the new one — exactly the mode's contract.
+ *
+ * Checks are ordered cheapest-first and the O(inodes) child-identity walk is only reached as a last resort,
+ * so the normal path pays nothing.
+ */
+export function localRenameCorroborated(
+	mode: SyncMode,
+	currentItem: LocalItem,
+	previousItem: LocalItem,
+	currentLocalTree: LocalTree,
+	previousLocalTree: LocalTree
+): boolean {
+	// A reliable (both non-zero, equal) birthtime is a genuine-rename signal in every mode.
+	if (currentItem.creation !== 0 && previousItem.creation !== 0 && currentItem.creation === previousItem.creation) {
+		return true
+	}
+
+	// Birthtime unreliable (reported 0 on either side). A mirror mode degrades to inode-only; an additive
+	// backup must NOT (a phantom file rename would destroy the kept backup).
+	if (mode !== "localBackup" && (currentItem.creation === 0 || previousItem.creation === 0)) {
+		return true
+	}
+
+	// Last resort (both modes): a DIRECTORY rename corroborated by a surviving child's identity — reliable even
+	// when the birthtime was rewritten (Windows) or is unavailable, and a reused dir inode is still rejected.
+	return (
+		currentItem.type === "directory" &&
+		directoryRenameCorroboratedByChild(previousItem.path, currentItem.path, currentLocalTree, previousLocalTree)
+	)
+}
+
+/**
  * Remaps `path` across a set of propagated directory renames, returning its post-rename path (unchanged if
  * none applies). The most-specific (longest `from`) ancestor wins, and each rename's `to` already encodes
  * any outer renames (the rename pass records every directory's FINAL position), so one pass handles
@@ -602,12 +647,9 @@ export class Deltas {
 					//       NONE of the old children). Windows was observed to rewrite a directory's birthtime across
 					//       a rename, which silently broke cross-side dir-rename reconciliation; (b) restores it
 					//       while a reused dir inode (no surviving children) is still correctly rejected.
-					// (F8 — inode reuse; birthtime-unreliable hardening)
-					(currentItem.creation === previousItem.creation ||
-						currentItem.creation === 0 ||
-						previousItem.creation === 0 ||
-						(currentItem.type === "directory" &&
-							directoryRenameCorroboratedByChild(previousItem.path, currentItem.path, currentLocalTree, previousLocalTree))) &&
+					// (F8 — inode reuse; birthtime-unreliable hardening; #5 — a birthtime-0 volume must not let an
+					// inode-reuse coincidence become a phantom rename that destroys a localBackup copy)
+					localRenameCorroborated(mode, currentItem, previousItem, currentLocalTree, previousLocalTree) &&
 					// Does ANY item already occupy the rename target in the current remote tree? If so, do not
 					// propagate the rename. A same-type occupant was probably moved there by something else; a
 					// DIFFERENT-type occupant (e.g. a file↔directory name swap) cannot be overwritten by a rename
