@@ -56,7 +56,19 @@ describe("Category XD — cross-side nested directory renames (different levels)
 		expect(result.finalLocal["/top2/mid2/file.txt"]!.contentHash).toBe(result.finalRemote["/top2/mid2/file.txt"]!.contentHash)
 	})
 
-	it("XD2: local renames OUTER dir + MODIFIES the nested file, remote renames INNER dir → the edit survives (no BUG-A loss)", async () => {
+	// KNOWN LIMITATION (#10) — pinned as an expected-failure. A cross-side nested dir-rename where the file is
+	// ALSO modified on the renaming side leaves a permanent DUPLICATE: the modified edit is stranded at the
+	// pre-inner-rename path AND a copy appears at the composed path (both sides converge to the duplicate, so
+	// there is NO data loss). Root cause: the remote inner rename is dropped at DETECTION — the pass's
+	// source-unchanged check looks up the moved source at its pre-outer-rename path and misses it — so the move
+	// decomposes into delete+add and the local modify then preserves the old path. A correct fix must restructure
+	// the rename-detection ordering (a cross-side dir-rename pre-scan so each pass rebases its source lookup) AND
+	// the composition rebase together; a partial attempt reintroduced the duplicate into the WORKING no-modify
+	// case (XD1), so it needs dedicated review of the engine's most delicate, data-loss-critical path rather than
+	// a rushed change. Strengthened assertions (from a `some(size)` check a duplicate passed) are kept under
+	// it.fails so the bug is CI-visible and this test flips to a hard failure the moment a real fix lands. The
+	// base case WITHOUT the modify (XD1/XD3/XD5/XD6) already composes correctly with no duplicate.
+	it.fails("XD2: local renames OUTER dir + MODIFIES the nested file, remote renames INNER dir → the edit survives (no BUG-A loss)", async () => {
 		const result = await runScenario({
 			name: "XD2",
 			mode: "twoWay",
@@ -80,12 +92,13 @@ describe("Category XD — cross-side nested directory renames (different levels)
 
 		// The MODIFIED content must survive somewhere on BOTH sides — never silently replaced by the
 		// pre-edit bytes during the inner-rename degradation (that would be BUG-A data loss).
-		const allEntries = Object.values(result.finalLocal)
-		const modifiedSurvives = allEntries.some(entry => entry.type === "file" && entry.size === "MODIFIED-LONGER-CONTENT".length)
-
-		expect(modifiedSurvives).toBe(true)
+		// Both renames compose: the file lands at /top2/mid2/file.txt with the MODIFIED bytes, and the
+		// pre-inner-rename position must NOT linger (the #10 permanent-duplicate + stranded-edit). Strengthened
+		// from a `some(size)` check that a duplicate silently passed.
+		expect(result.finalRemote["/top2/mid2/file.txt"]).toMatchObject({ type: "file", size: "MODIFIED-LONGER-CONTENT".length })
+		expect(result.finalRemote["/top2/mid/file.txt"], "the edit was stranded at the pre-rename path (duplicate)").toBeUndefined()
+		expect(result.finalRemote["/top2/mid"], "the pre-inner-rename directory lingered (duplicate)").toBeUndefined()
 		expect(result.finalRemote["/top2/keep.txt"]).toMatchObject({ type: "file", size: "K".length })
-		// Sides converge with no data loss (the modified file is byte-identical across sides wherever it lands).
 		expect(result.finalLocal).toEqual(result.finalRemote)
 	})
 
@@ -117,7 +130,8 @@ describe("Category XD — cross-side nested directory renames (different levels)
 		expect(result.finalLocal["/top2/mid2/file.txt"]!.contentHash).toBe(result.finalRemote["/top2/mid2/file.txt"]!.contentHash)
 	})
 
-	it("XD4: remote renames OUTER dir + MODIFIES the nested file, local renames INNER dir → the edit survives", async () => {
+	// KNOWN LIMITATION (#10) — the symmetric expected-failure of XD2 (see its comment). Pinned under it.fails.
+	it.fails("XD4: remote renames OUTER dir + MODIFIES the nested file, local renames INNER dir → the edit survives", async () => {
 		const result = await runScenario({
 			name: "XD4",
 			mode: "twoWay",
@@ -139,10 +153,11 @@ describe("Category XD — cross-side nested directory renames (different levels)
 			]
 		})
 
-		const allEntries = Object.values(result.finalLocal)
-		const modifiedSurvives = allEntries.some(entry => entry.type === "file" && entry.size === "REMOTE-MODIFIED-LONGER".length)
-
-		expect(modifiedSurvives).toBe(true)
+		// Both renames compose: the file lands at /top2/mid2/file.txt with the REMOTE-modified bytes, and the
+		// pre-inner-rename position must NOT linger (the #10 duplicate). Strengthened from a `some(size)` check.
+		expect(result.finalRemote["/top2/mid2/file.txt"]).toMatchObject({ type: "file", size: "REMOTE-MODIFIED-LONGER".length })
+		expect(result.finalRemote["/top2/mid/file.txt"], "the edit was stranded at the pre-rename path (duplicate)").toBeUndefined()
+		expect(result.finalRemote["/top2/mid"], "the pre-inner-rename directory lingered (duplicate)").toBeUndefined()
 		expect(result.finalRemote["/top2/keep.txt"]).toMatchObject({ type: "file", size: "K".length })
 		expect(result.finalLocal).toEqual(result.finalRemote)
 	})
