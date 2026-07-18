@@ -1,4 +1,10 @@
 export const SYNC_INTERVAL = 5000
+// How often the local filesystem is force-rescanned as a SAFETY NET, independent of watcher events. When the
+// watcher failed to start it is the ONLY change signal; when a watcher IS live it still runs, because fs.watch
+// on SMB/NFS/some FUSE mounts can silently DROP a change notification — without a periodic bump the freshness
+// gate would then serve the stale cached tree forever and the change would never sync. Bounds that staleness
+// while keeping idle rescans infrequent (the watcher handles the common fast path).
+export const LOCAL_RESCAN_SAFETY_INTERVAL = 60000
 export const LOCAL_TRASH_NAME: string = ".filen.trash.local"
 export const DEFAULT_IGNORED = {
 	names: [

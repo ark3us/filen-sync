@@ -15,7 +15,7 @@ import {
 } from "../../utils"
 import pathModule from "path"
 import type Sync from "../sync"
-import { SYNC_INTERVAL, LOCAL_TRASH_NAME } from "../../constants"
+import { SYNC_INTERVAL, LOCAL_TRASH_NAME, LOCAL_RESCAN_SAFETY_INTERVAL } from "../../constants"
 import crypto from "crypto"
 import { pipeline } from "stream"
 import { promisify } from "util"
@@ -307,7 +307,14 @@ export class LocalFileSystem {
 				if (
 					this.lastDirectoryChangeTimestamp > 0 &&
 					this.getDirectoryTreeCache.timestamp > 0 &&
-					this.lastDirectoryChangeTimestamp < this.getDirectoryTreeCache.timestamp
+					this.lastDirectoryChangeTimestamp < this.getDirectoryTreeCache.timestamp &&
+					// SAFETY RESCAN (#16): only serve the cache while it is still FRESH. fs.watch on SMB/NFS (and some
+					// FUSE mounts) can silently DROP a change notification, so lastDirectoryChangeTimestamp never moves
+					// and this gate would otherwise serve the stale tree FOREVER — the change never syncs. Once the
+					// cache ages past LOCAL_RESCAN_SAFETY_INTERVAL, fall through to a full re-enumeration regardless.
+					// This is a per-call check, NOT a recurring timer, so it costs a rescan at most once per interval
+					// (the watcher still handles the common fast path) and never leaves a timer running.
+					Date.now() - this.getDirectoryTreeCache.timestamp < LOCAL_RESCAN_SAFETY_INTERVAL
 				) {
 					resolve({
 						result: {
@@ -618,7 +625,7 @@ export class LocalFileSystem {
 
 			this.watcherInstanceFallbackInterval = setInterval(() => {
 				this.lastDirectoryChangeTimestamp = Date.now()
-			}, 60000)
+			}, LOCAL_RESCAN_SAFETY_INTERVAL)
 		} finally {
 			this.watcherMutex.release()
 		}
