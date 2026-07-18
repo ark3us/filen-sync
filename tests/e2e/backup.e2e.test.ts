@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest"
 import type FilenSDK from "@filen/sdk"
 import { E2E_ENABLED, loginTestSDK, teardownTestSDK } from "./harness/account"
 import { withE2EWorld } from "./harness/world"
-import { settle } from "./harness/drive"
+import { settle, cycle, allOps, messagesOfType } from "./harness/drive"
 import { snapshotRemoteReal } from "./harness/assert"
 import { writeLocal, modifyLocal, rmLocal, renameLocal, readLocal, existsLocal, uploadRemote, deleteRemote } from "./harness/mutations"
 
@@ -73,6 +73,35 @@ describe.skipIf(!E2E_ENABLED)("E2E — backup modes (additive)", () => {
 			// The remote keeps the foreign edit; the local copy is untouched (additive — never reverts).
 			expect((await snapshotRemoteReal(world, { withContent: true }))["/a.txt"]!.size).toBe("FOREIGN-EDIT".length)
 			expect(await readLocal(world, "a.txt")).toBe("local-content")
+		})
+	})
+
+	it("localBackup: a foreign remote dir→file replacement does not wedge the pair (Fix #6)", async () => {
+		await withE2EWorld({ sdk, mode: "localBackup" }, async world => {
+			await writeLocal(world, "d/child.txt", "c")
+			await writeLocal(world, "keep.txt", "k")
+			await settle(world)
+
+			expect((await snapshotRemoteReal(world))["/d/child.txt"]).toMatchObject({ type: "file" })
+
+			// A peer replaces the remote /d directory with a FILE of the same name. The backend cannot place
+			// /d/child.txt under a file, so before the fix the upload errored every cycle and the pair wedged.
+			await deleteRemote(world, "d")
+			await uploadRemote(world, "d", "foreign-file")
+			await settle(world)
+
+			// No wedge: a final settled cycle is a clean no-op with no repeating task error.
+			const messages = await cycle(world)
+
+			expect(allOps(messages), "the pair never settled").toEqual([])
+			expect(
+				messagesOfType(messages, "taskErrors").reduce((n, m) => n + m.data.errors.length, 0),
+				"the pair wedged on a repeating upload-under-a-file error"
+			).toBe(0)
+
+			// The foreign remote file is tolerated; the local source is intact (no data loss).
+			expect((await snapshotRemoteReal(world))["/d"]).toMatchObject({ type: "file" })
+			expect(await existsLocal(world, "d/child.txt")).toBe(true)
 		})
 	})
 

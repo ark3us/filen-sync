@@ -326,6 +326,42 @@ function renameDestinationBlockedByFileAncestor(
 }
 
 /**
+ * Whether an ADDITION at `path` cannot be written because the nearest existing ancestor on the DESTINATION
+ * side is a FILE that will NOT be replaced by a directory this cycle. The backend cannot place a child under a
+ * file, so emitting the upload/mkdir would be rejected EVERY cycle and wedge the pair on a repeating
+ * taskError. This is the additive-backup foreign-type-change case: localBackup tolerates a foreign remote
+ * dir→file at `/d` (reverting it would delete the backup), but still tried to back up `/d/child` under the
+ * remote file. A file ancestor CLAIMED FOR REPLACEMENT this cycle (`pathsAdded[ancestor]` — the type-change
+ * pass emitted a create*Directory for it, which runs first in phase order) is NOT a blocker; only an
+ * unreplaced one is. Suppressing the addition leaves the subtree un-synced until the foreign file is removed —
+ * no wedge, and the additive contract (never delete the foreign side) is preserved. Walks to the nearest
+ * existing ancestor; O(depth), evaluated only for an addition candidate, so it never scans the unchanged bulk.
+ */
+function additionBlockedByUnreplacedFileAncestor(
+	tree: { tree: Record<string, { type: "file" | "directory" } | undefined> },
+	path: string,
+	pathsAdded: Record<string, boolean>
+): boolean {
+	let slash = path.lastIndexOf("/")
+
+	while (slash > 0) {
+		const ancestorPath = path.slice(0, slash)
+		const ancestor = tree.tree[ancestorPath]
+
+		if (ancestor) {
+			// Nearest existing ancestor decides: a file blocks — unless it is being replaced by a directory this
+			// cycle (its create*Directory delta runs before this addition). A directory never blocks.
+			return ancestor.type !== "directory" && !pathsAdded[ancestorPath]
+		}
+
+		slash = path.lastIndexOf("/", slash - 1)
+	}
+
+	// No existing ancestor before the root: every intermediate will be created as a directory.
+	return false
+}
+
+/**
  * Whether a directory rename `fromDir` → `toDir` is corroborated by a surviving child IDENTITY: some inode
  * that lived under `fromDir` in the base now lives under `toDir` in the current tree. Used only as a
  * fallback when the directory's birthtime does not match across the rename (a platform that rewrites a
@@ -1373,6 +1409,15 @@ export class Deltas {
 					// Does an item with the same path and type already exist in the current remote tree (probably uploaded by something else prior)?
 					!(ciGet(currentRemoteTree.tree, path) && ciGet(currentRemoteTree.tree, path)!.type === currentLocalItem.type)
 				) {
+					// Do NOT emit an upload/mkdir under a remote FILE ancestor this cycle won't replace: the backend
+					// rejects a child under a file and the task errors EVERY cycle, wedging the pair. This is the
+					// additive-backup foreign dir→file case (localBackup tolerates the remote file at `/d`, so
+					// `/d/child` cannot be backed up under it). Leave the subtree un-synced until the foreign file is
+					// gone — no wedge, additive contract preserved. (#6)
+					if (additionBlockedByUnreplacedFileAncestor(currentRemoteTree, path, pathsAdded)) {
+						continue
+					}
+
 					deltas.push({
 						type: currentLocalItem.type === "directory" ? "createRemoteDirectory" : "uploadFile",
 						path,
@@ -1521,6 +1566,14 @@ export class Deltas {
 						hasIgnoredOrErroredLocalAncestor(path) ||
 						((ignoredLocalPaths[path] || erroredLocalPaths[path]) && currentRemoteItem.type === "directory")
 					) {
+						continue
+					}
+
+					// Symmetric to the upload pass (#6): don't create local content under a LOCAL file ancestor this
+					// cycle won't replace (the cloudBackup foreign dir→file case) — the local fs rejects a child under
+					// a file and the task wedges every cycle. Leave the subtree un-synced until the foreign file is
+					// gone.
+					if (additionBlockedByUnreplacedFileAncestor(currentLocalTree, path, pathsAdded)) {
 						continue
 					}
 

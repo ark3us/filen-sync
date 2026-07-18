@@ -199,6 +199,18 @@ export function createFakeCloud(initial: CloudSpec = {}, deps: { localFs: SyncFS
 		return liveChildren(parentUUID).find(node => node.name.toLowerCase() === lowercased)
 	}
 
+	// Faithfulness: the real backend cannot place a child under a FILE (or an absent/trashed) parent — the
+	// request is rejected. The fake previously accepted any `parent` uuid, so an engine bug that resolved a
+	// file's uuid as a directory parent (uploading/mkdir'ing UNDER a file) produced a FALSE GREEN. Reject it
+	// exactly as the backend would, so those wedges reproduce in the mocked suite.
+	const assertLiveDirectoryParent = (parentUUID: string, operation: string): void => {
+		const parentNode = nodes.get(parentUUID)
+
+		if (!parentNode || parentNode.state !== "live" || parentNode.type !== "directory") {
+			throw new Error(`Cannot ${operation}: parent ${parentUUID} is not a live directory.`)
+		}
+	}
+
 	const pathOf = (node: Node): string => {
 		const parts: string[] = []
 		let current: Node | undefined = node
@@ -462,6 +474,7 @@ export function createFakeCloud(initial: CloudSpec = {}, deps: { localFs: SyncFS
 				renameIfExists?: boolean
 			}): Promise<string> => {
 				guard("createDirectory")
+				assertLiveDirectoryParent(parent, `create directory "${name}"`)
 
 				const existing = findLiveByName(parent, name)
 
@@ -527,6 +540,8 @@ export function createFakeCloud(initial: CloudSpec = {}, deps: { localFs: SyncFS
 					}
 
 					const fileName = name ?? pathModule.basename(source)
+
+					assertLiveDirectoryParent(parent, `upload "${fileName}"`)
 					const stats = await deps.localFs.stat(source)
 					const content = (await deps.localFs.readFile(source)) as unknown as Buffer
 					const size = stats.size
