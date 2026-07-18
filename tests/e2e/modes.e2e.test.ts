@@ -124,6 +124,19 @@ describe.skipIf(!E2E_ENABLED)("E2E — one-way mode semantics", () => {
 		})
 	})
 
+	it("cloudToLocal: a remote file merely CONTAINING the trash name mid-path converges (#15)", async () => {
+		await withE2EWorld({ sdk, mode: "cloudToLocal" }, async world => {
+			// The name contains ".filen.trash.local" mid-path but is a normal user file — the local scan's old
+			// substring skip dropped it, so it re-downloaded every cycle and never converged.
+			await uploadRemote(world, "notes/x.filen.trash.local.txt", "data")
+			await settle(world)
+			await expectConverged(world)
+
+			expect(await existsLocal(world, "notes/x.filen.trash.local.txt"), "the file was dropped by the trash-name skip").toBe(true)
+			expect(await readLocal(world, "notes/x.filen.trash.local.txt")).toBe("data")
+		})
+	})
+
 	// ---- strict mirror: the foreign side is forced to match the authoritative side ----------------
 
 	it("cloudToLocal: a no-base same-size local stray is reverted to the remote bytes (#12)", async () => {

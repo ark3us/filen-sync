@@ -435,7 +435,16 @@ export class LocalFileSystem {
 
 						const entryPath = "/" + entryItem
 
-						if (entryPath.includes(LOCAL_TRASH_NAME)) {
+						// Skip the local trash directory's contents, matching the REMOTE build's BOUNDARY semantics
+						// (name.startsWith), NOT a substring match. `includes` dropped any user path merely CONTAINING
+						// ".filen.trash.local" mid-name (e.g. /notes/x.filen.trash.local.txt) — which the remote keeps — so
+						// cloudToLocal re-downloaded it forever and the pair never converged. Skip only an entry whose
+						// BASENAME starts with the trash prefix (the trash dir itself + a peer's same-named file, as the
+						// remote does) or a descendant of the actual trash root. (#15)
+						if (
+							pathModule.posix.basename(entryItem).startsWith(LOCAL_TRASH_NAME) ||
+							entryPath.startsWith("/" + LOCAL_TRASH_NAME + "/")
+						) {
 							return
 						}
 
