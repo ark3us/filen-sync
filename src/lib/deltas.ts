@@ -1451,8 +1451,15 @@ export class Deltas {
 						? previousLocalItem.size !== currentLocalItem.size ||
 							normalizeLastModifiedMsForComparison(previousLocalItem.lastModified) !==
 								normalizeLastModifiedMsForComparison(currentLocalItem.lastModified)
-						: normalizeLastModifiedMsForComparison(currentLocalItem.lastModified) >
-							normalizeLastModifiedMsForComparison(currentRemoteItem.lastModified)
+						: // No base: the local copy is "changed" (relative to the stray remote) when it is strictly
+							// newer OR the SIZES differ. A size difference is proof the bytes differ, so it must not be
+							// discarded — without it, an equal-whole-second mtime with different sizes emitted neither an
+							// upload nor a download and the two provably-different files diverged forever. The equal-mtime
+							// tie resolves to local via localWins (local runs first, `>=`), symmetric to the directional
+							// modes' noBaseSizeDiverged. (#11)
+							normalizeLastModifiedMsForComparison(currentLocalItem.lastModified) >
+								normalizeLastModifiedMsForComparison(currentRemoteItem.lastModified) ||
+							currentLocalItem.size !== currentRemoteItem.size
 					const remoteChanged = !previousRemoteItem || currentRemoteItem.uuid !== previousRemoteItem.uuid
 					// Directional push modes (localToCloud / localBackup): the LOCAL side is authoritative, so a
 					// local change ALWAYS wins. The newer-mtime tiebreak is twoWay conflict resolution and must

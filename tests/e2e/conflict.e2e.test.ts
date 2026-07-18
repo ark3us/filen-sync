@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest"
+import pathModule from "path"
 import type FilenSDK from "@filen/sdk"
 import { E2E_ENABLED, loginTestSDK, teardownTestSDK } from "./harness/account"
 import { withE2EWorld } from "./harness/world"
@@ -42,6 +43,34 @@ describe.skipIf(!E2E_ENABLED)("E2E — twoWay conflict resolution", () => {
 
 			await expectConverged(world)
 			expect(await readLocal(world, "c.txt")).toBe("LOCAL-WINS")
+		})
+	})
+
+	it("no base, EQUAL-second mtime but DIFFERENT sizes → converges (tie to local, #11)", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
+			const T = 1_600_000_000_000 // a fixed whole second
+
+			// Seed the REMOTE with a differently-sized copy at mtime T: stamp a local file at T and upload it raw
+			// (bypassing the engine so no base is created), then re-purpose the local file.
+			await writeLocal(world, "nb.txt", "REMOTE-TEN-X")
+			await setLocalMtime(world, "nb.txt", T)
+			await world.sdk.cloud().uploadLocalFile({
+				source: pathModule.join(world.localRoot, "nb.txt"),
+				parent: world.remoteParentUUID,
+				name: "nb.txt"
+			})
+
+			// The LOCAL copy now carries DIFFERENT bytes at the SAME whole second — and there is no base yet.
+			await writeLocal(world, "nb.txt", "LOCAL-5")
+			await setLocalMtime(world, "nb.txt", T)
+
+			await settle(world)
+			await expectConverged(world)
+
+			// The size divergence is not discarded; the equal-mtime tie resolves to local (it wins because the
+			// local additions pass runs first). Without the fix neither side transfers and they diverge forever.
+			expect(await readLocal(world, "nb.txt")).toBe("LOCAL-5")
+			expect((await snapshotRemoteReal(world))["/nb.txt"]).toMatchObject({ type: "file", size: "LOCAL-5".length })
 		})
 	})
 
