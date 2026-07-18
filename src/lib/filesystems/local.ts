@@ -813,16 +813,22 @@ export class LocalFileSystem {
 			delete this.getDirectoryTreeCache.inodes[item.inode]
 			delete this.sync.localFileHashes[relativePath]
 
-			for (const entry in this.getDirectoryTreeCache.tree) {
-				if (entry.startsWith(relativePath + "/") || entry === relativePath) {
-					const entryItem = this.getDirectoryTreeCache.tree[entry]
+			// Only a DIRECTORY has descendants to evict. Scanning the whole tree for children of a FILE finds
+			// nothing (a file has none) — and running that O(tree) scan on every unlink made a bulk deletion
+			// O(N²): deleting a large flat folder appeared to hang for minutes. A file is removed by the three
+			// direct deletes above; skip the subtree walk for it entirely. (#9)
+			if (item.type === "directory") {
+				for (const entry in this.getDirectoryTreeCache.tree) {
+					if (entry.startsWith(relativePath + "/") || entry === relativePath) {
+						const entryItem = this.getDirectoryTreeCache.tree[entry]
 
-					if (entryItem) {
-						delete this.getDirectoryTreeCache.inodes[entryItem.inode]
+						if (entryItem) {
+							delete this.getDirectoryTreeCache.inodes[entryItem.inode]
+						}
+
+						delete this.sync.localFileHashes[entry]
+						delete this.getDirectoryTreeCache.tree[entry]
 					}
-
-					delete this.sync.localFileHashes[entry]
-					delete this.getDirectoryTreeCache.tree[entry]
 				}
 			}
 

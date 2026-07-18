@@ -789,6 +789,10 @@ export class RemoteFileSystem {
 		permanent?: boolean
 	}): Promise<void> {
 		let uuid: string | null = null
+		// The unlinked item's type, captured once resolved so cleanItemEntry can skip the O(tree) subtree walk
+		// for a FILE (a file has no descendants). Running that walk on every unlink made a bulk remote deletion
+		// O(N²). (#9)
+		let unlinkItemType: FSItemType | undefined = undefined
 
 		const cleanItemEntry = async () => {
 			if (!uuid) {
@@ -800,15 +804,18 @@ export class RemoteFileSystem {
 			delete this.getDirectoryTreeCache.tree[relativePath]
 			delete this.getDirectoryTreeCache.uuids[uuid]
 
-			for (const entry in this.getDirectoryTreeCache.tree) {
-				if (entry.startsWith(relativePath + "/") || entry === relativePath) {
-					const entryItem = this.getDirectoryTreeCache.tree[entry]
+			// Only a DIRECTORY has descendants to evict; a file is fully removed by the two deletes above.
+			if (unlinkItemType === "directory") {
+				for (const entry in this.getDirectoryTreeCache.tree) {
+					if (entry.startsWith(relativePath + "/") || entry === relativePath) {
+						const entryItem = this.getDirectoryTreeCache.tree[entry]
 
-					if (entryItem) {
-						delete this.getDirectoryTreeCache.uuids[entryItem.uuid]
+						if (entryItem) {
+							delete this.getDirectoryTreeCache.uuids[entryItem.uuid]
+						}
+
+						delete this.getDirectoryTreeCache.tree[entry]
 					}
-
-					delete this.getDirectoryTreeCache.tree[entry]
 				}
 			}
 
@@ -824,6 +831,8 @@ export class RemoteFileSystem {
 			if (!uuid || !item) {
 				return
 			}
+
+			unlinkItemType = item.type
 
 			const acceptedTypes: FSItemType[] = !type ? ["directory", "file"] : type === "directory" ? ["directory"] : ["file"]
 
