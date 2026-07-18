@@ -105,6 +105,31 @@ describe.skipIf(!E2E_ENABLED)("E2E — backup modes (additive)", () => {
 		})
 	})
 
+	it("localBackup: an originated dir→file does NOT delete a concurrent foreign remote child (Fix #13)", async () => {
+		await withE2EWorld({ sdk, mode: "localBackup" }, async world => {
+			await writeLocal(world, "d/synced.txt", "s")
+			await writeLocal(world, "keep.txt", "k")
+			await settle(world)
+
+			expect((await snapshotRemoteReal(world))["/d/synced.txt"]).toMatchObject({ type: "file" })
+
+			// Another device adds a child under /d on the backup, while locally /d is replaced by a file. The
+			// originated dir→file must NOT recursively delete the backup directory and its (foreign + synced)
+			// children — the additive contract is "never delete the backup".
+			await uploadRemote(world, "d/foreign.txt", "foreign")
+			await rmLocal(world, "d")
+			await writeLocal(world, "d", "now-a-file")
+			await settle(world)
+
+			const remote = await snapshotRemoteReal(world)
+
+			expect(remote["/d/foreign.txt"], "the foreign backup child was deleted").toMatchObject({ type: "file" })
+			expect(remote["/d/synced.txt"]).toMatchObject({ type: "file" })
+			expect(remote["/d"]).toMatchObject({ type: "directory" })
+			expect(await existsLocal(world, "d")).toBe(true)
+		})
+	})
+
 	// ---- cloudBackup ------------------------------------------------------------------------------
 
 	it("cloudBackup: a new remote file is downloaded", async () => {

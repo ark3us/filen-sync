@@ -1323,6 +1323,19 @@ export class Deltas {
 					continue
 				}
 
+				// Additive backup, ORIGINATED dir->file (#13, sibling of #6): propagating it would recursively
+				// delete the backup-side DIRECTORY — destroying any FOREIGN child another device added under it, and
+				// even the synced children this mode keeps on a local deletion. The contract is "never delete the
+				// backup", so tolerate the divergence instead: keep the backup directory + its children, leave the
+				// new file un-backed-up. Only a directory delete recurses, so this is gated on the target being a
+				// directory; a file->dir change (deleting a leaf file) is unaffected.
+				if (
+					(mode === "localBackup" && currentRemoteItem.type === "directory") ||
+					(mode === "cloudBackup" && currentLocalItem.type === "directory")
+				) {
+					continue
+				}
+
 				let localWins: boolean
 
 				if (mode === "localBackup" || mode === "localToCloud") {
