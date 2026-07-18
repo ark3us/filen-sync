@@ -1671,7 +1671,13 @@ export class Deltas {
 						(previousLocalItem.size !== currentLocalItem.size ||
 							normalizeLastModifiedMsForComparison(previousLocalItem.lastModified) !==
 								normalizeLastModifiedMsForComparison(currentLocalItem.lastModified))
-					const mirrorRevert = mode === "cloudToLocal" && localDiverged
+					// Strict mirror on NO base too (#12): a stray local file at a path the remote also holds must be
+					// reverted to the remote's bytes even when the SIZES match — noBaseSizeDiverged only catches a
+					// size difference, so a same-size, different-content, newer-mtime stray otherwise survives forever
+					// and the "local equals remote" contract is silently broken. Symmetric to localToCloud, whose
+					// mirror revert already fires on no base (remoteChanged is true there). Establishes the base on
+					// the resulting download, so it does not churn.
+					const mirrorRevert = mode === "cloudToLocal" && (localDiverged || !previousLocalItem)
 					// Directional pull with NO local base: a stray local file occupies a path the remote also has
 					// (e.g. the local copy was deleted then re-created with different content). It cannot be the
 					// synced copy if the SIZES differ, so the authoritative remote wins — pull it down. (F9)

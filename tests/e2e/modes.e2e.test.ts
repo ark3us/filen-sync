@@ -4,7 +4,18 @@ import { E2E_ENABLED, loginTestSDK, teardownTestSDK } from "./harness/account"
 import { withE2EWorld } from "./harness/world"
 import { settle, expectConverged } from "./harness/drive"
 import { snapshotLocalReal, snapshotRemoteReal } from "./harness/assert"
-import { writeLocal, modifyLocal, rmLocal, renameLocal, renameRemoteDir, readLocal, existsLocal, uploadRemote, deleteRemote } from "./harness/mutations"
+import {
+	writeLocal,
+	modifyLocal,
+	rmLocal,
+	renameLocal,
+	renameRemoteDir,
+	readLocal,
+	existsLocal,
+	uploadRemote,
+	deleteRemote,
+	setLocalMtime
+} from "./harness/mutations"
 
 /**
  * Phase 3 e2e — one-way mode semantics against the live backend. localToCloud pushes local changes up
@@ -114,6 +125,26 @@ describe.skipIf(!E2E_ENABLED)("E2E — one-way mode semantics", () => {
 	})
 
 	// ---- strict mirror: the foreign side is forced to match the authoritative side ----------------
+
+	it("cloudToLocal: a no-base same-size local stray is reverted to the remote bytes (#12)", async () => {
+		await withE2EWorld({ sdk, mode: "cloudToLocal" }, async world => {
+			// Remote authoritative copy.
+			await uploadRemote(world, "f.txt", "REMOTbb")
+
+			// A local stray of the SAME byte length but different content and a clearly-NEWER mtime, with no base
+			// yet. Same size defeats noBaseSizeDiverged; newer mtime defeats strictly-newer-remote — only the
+			// mirror revert can catch it. The mirror must still force the local copy to the remote's bytes.
+			await writeLocal(world, "f.txt", "LOCALaa")
+			await setLocalMtime(world, "f.txt", Date.now() + 60_000)
+
+			await settle(world)
+			await expectConverged(world)
+
+			expect(await readLocal(world, "f.txt"), "the local stray was not reverted to the remote copy").toBe("REMOTbb")
+			// cloudToLocal never uploads: the remote keeps its bytes.
+			expect((await snapshotRemoteReal(world, { withContent: true }))["/f.txt"]!.size).toBe(Buffer.from("REMOTbb").length)
+		})
+	})
 
 	it("localToCloud: a remote-only file is mirror-DELETED", async () => {
 		await withE2EWorld({ sdk, mode: "localToCloud" }, async world => {
