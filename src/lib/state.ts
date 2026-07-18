@@ -441,15 +441,17 @@ export class State {
 	public async readLargeRecordFromLineStream<T = unknown>(inputPath: string): Promise<Record<string, T>> {
 		const record: Record<string, T> = {}
 
-		const rl = readline.createInterface({
-			input: this.sync.environment.fs.createReadStream(inputPath, {
-				encoding: "utf-8"
-			}),
-			crlfDelay: Infinity,
-			terminal: false
-		})
+		let rl: readline.Interface | undefined
 
 		try {
+			rl = readline.createInterface({
+				input: this.sync.environment.fs.createReadStream(inputPath, {
+					encoding: "utf-8"
+				}),
+				crlfDelay: Infinity,
+				terminal: false
+			})
+
 			for await (const line of rl) {
 				// Cheap non-empty check instead of allocating a trimmed copy per line on the load hot path; a
 				// whitespace-only line still drops harmlessly via the JSON.parse failure caught below.
@@ -468,8 +470,18 @@ export class State {
 					}
 				}
 			}
+		} catch (e) {
+			// A read fault while loading a base file — a stream 'error' event MID-read (a transient EIO on a
+			// network FS) or a failure opening the stream — must NOT propagate. Only the per-line JSON.parse was
+			// guarded before, so a stream fault threw straight out of the state load and wedged initialize(): the
+			// pair did no work until a process restart. Degrade to an EMPTY record so the pair re-derives its base
+			// by a full re-scan (the incomplete-read guards + no-base fallbacks converge it safely, and a genuine
+			// deletion is merely delayed to the next clean load) rather than failing to start. (#17)
+			this.sync.worker.logger.log("error", e, "state.readLargeRecordFromLineStream")
+
+			return {}
 		} finally {
-			rl.close()
+			rl?.close()
 		}
 
 		return record

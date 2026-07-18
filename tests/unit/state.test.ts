@@ -5,7 +5,7 @@ import { State } from "../../src/lib/state"
 import { type LocalItem, type LocalTree } from "../../src/lib/filesystems/local"
 import { type RemoteItem, type RemoteTree } from "../../src/lib/filesystems/remote"
 import { type DoneTask } from "../../src/lib/tasks"
-import { createVirtualFS, toPosixPath, type VirtualFS } from "../fakes/virtual-fs"
+import { createVirtualFS, toPosixPath, makeErrnoError, type VirtualFS } from "../fakes/virtual-fs"
 import type Sync from "../../src/lib/sync"
 
 /**
@@ -37,6 +37,7 @@ type StateSyncStub = {
 	previousRemoteTree: RemoteTree
 	isPreviousSavedTreeStateEmpty: boolean
 	removed: boolean
+	worker: { logger: { log: (...args: unknown[]) => void } }
 }
 
 function makeSyncStub(vfs: VirtualFS, uuid: string): StateSyncStub {
@@ -48,7 +49,8 @@ function makeSyncStub(vfs: VirtualFS, uuid: string): StateSyncStub {
 		previousLocalTree: { tree: {}, inodes: {}, size: 0 },
 		previousRemoteTree: { tree: {}, uuids: {}, size: 0 },
 		isPreviousSavedTreeStateEmpty: true,
-		removed: false
+		removed: false,
+		worker: { logger: { log: () => {} } }
 	}
 }
 
@@ -229,6 +231,21 @@ describe("State — line-delimited serializer/reader", () => {
 			"/valid2": "v2",
 			"/valid3": "v3"
 		})
+	})
+
+	it("degrades to an empty record on a read fault instead of throwing (Fix #17)", async () => {
+		const vfs = createVirtualFS()
+		const state = makeState(makeSyncStub(vfs, "read-fault-uuid"))
+		const dest = pathModule.join(state.statePath, "previousLocalTree")
+
+		// Persist a valid base file, then inject a read fault on that exact path (a transient EIO on a network
+		// FS). Only per-line JSON.parse was guarded before, so the stream fault propagated out of the state load
+		// and wedged initialize() until a process restart.
+		await state.writeLargeRecordSerializedAndAtomically(dest, { "/a.txt": "data" })
+		vfs.controls.setError(dest, makeErrnoError("EIO", "input/output error"))
+
+		// It must NOT throw — it degrades to an empty record so the pair re-derives its base rather than wedging.
+		await expect(state.readLargeRecordFromLineStream<string>(dest)).resolves.toEqual({})
 	})
 })
 
