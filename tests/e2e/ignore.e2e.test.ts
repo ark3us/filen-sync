@@ -120,4 +120,49 @@ describe.skipIf(!E2E_ENABLED)("E2E — ignore filtering", () => {
 			expect(await existsLocal(world, "keep-me.txt")).toBe(true)
 		})
 	})
+
+	it("the 'ignore all node_modules, keep this one' idiom syncs the re-included subtree", async () => {
+		// Fix #2: a bare-name rule must not emit a **-prefixed prune that drops a deeper, negation-re-included
+		// instance from the scan. keep/node_modules is re-included and must reach the cloud; top-level stays out.
+		await withE2EWorld({ sdk, mode: "twoWay", filenIgnore: "node_modules\n!keep/node_modules/\n" }, async world => {
+			await writeLocal(world, "app.js", "a")
+			await writeLocal(world, "node_modules/dep.js", "d")
+			await writeLocal(world, "keep/node_modules/lib.js", "L")
+			await writeLocal(world, "keep/node_modules/nested/deep.js", "D")
+			await settle(world)
+
+			const remote = await snapshotRemoteReal(world)
+
+			expect(remote["/keep/node_modules/lib.js"]).toMatchObject({ type: "file" })
+			expect(remote["/keep/node_modules/nested/deep.js"]).toMatchObject({ type: "file" })
+			expect(remote["/app.js"]).toMatchObject({ type: "file" })
+			expect(remote["/node_modules/dep.js"]).toBeUndefined()
+		})
+	})
+
+	it("introducing that idiom AFTER the subtree synced does not delete the re-included cloud copy", async () => {
+		// Fix #2 (the data-loss path): over a settled base the wrong prune read as a deletion and trashed the
+		// re-included subtree from the cloud. The matcher KEEPS it, so it must survive the rescan.
+		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
+			await writeLocal(world, "keep/node_modules/lib.js", "L")
+			await writeLocal(world, "keep/node_modules/nested/deep.js", "D")
+			await writeLocal(world, "other.txt", "O")
+			await settle(world)
+
+			// The whole subtree synced up.
+			expect((await snapshotRemoteReal(world))["/keep/node_modules/lib.js"]).toMatchObject({ type: "file" })
+
+			// Introduce the idiom; keep/node_modules is re-included, so it must NOT be deleted from the cloud.
+			await world.worker.updateIgnorerContent(world.syncPair.uuid, "node_modules\n!keep/node_modules/")
+			await writeLocal(world, "trigger.txt", "t")
+			await settle(world)
+
+			const remote = await snapshotRemoteReal(world)
+
+			expect(remote["/keep/node_modules/lib.js"]).toMatchObject({ type: "file" })
+			expect(remote["/keep/node_modules/nested/deep.js"]).toMatchObject({ type: "file" })
+			expect(remote["/other.txt"]).toMatchObject({ type: "file" })
+			expect(await existsLocal(world, "keep/node_modules/lib.js")).toBe(true)
+		})
+	})
 })

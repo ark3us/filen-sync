@@ -202,6 +202,34 @@ export class Ignorer {
 		const globMetacharacters = /[*?[\]{}()!+@^$|\\]/
 		const globs = new Set<string>()
 
+		// An unanchored (bare-name) candidate emits a `**`-prefixed glob that prunes EVERY directory of that
+		// name at EVERY depth. A negation can re-include one DEEPER instance's subtree — the standard
+		// "node_modules\n!keep/node_modules/" idiom — which the matcher then KEEPS while the glob would still
+		// prune it: a subtree silently dropped from the scan (no backup; a base-seeded copy trashed from the
+		// cloud). gitignore only lets such a negation take effect when the re-included directory's PARENT is not
+		// itself excluded, and the sole bare candidate it can collide with is the one sharing the negation's
+		// final path segment. So collect every negation's basename up-front and never emit an unanchored prune
+		// for a name a negation re-includes. Anchored candidates prune one fixed subtree whose root dir is
+		// excluded as a whole — gitignore then forbids re-including ANY descendant (verified against ignore@7) —
+		// so they need no such guard. Folded to lower case so the guard is conservative on case-fold volumes
+		// (over-withholding only ever costs the optimization, never correctness).
+		const negatedBasenames = new Set<string>()
+
+		for (const rawLine of content.split("\n")) {
+			const line = rawLine.trim()
+
+			if (!line.startsWith("!")) {
+				continue
+			}
+
+			const negatedBody = line.slice(1).replace(/^\/+/, "").replace(/\/+$/, "")
+			const negatedBasename = negatedBody.slice(negatedBody.lastIndexOf("/") + 1)
+
+			if (negatedBasename.length > 0) {
+				negatedBasenames.add(negatedBasename.toLowerCase())
+			}
+		}
+
 		for (const rawLine of content.split("\n")) {
 			const line = rawLine.trim()
 
@@ -222,6 +250,13 @@ export class Ignorer {
 			const relative = body.replace(/^\/+/, "").replace(/\/+$/, "")
 
 			if (relative.length === 0) {
+				continue
+			}
+
+			// A negation re-includes a deeper instance of this bare name → its `**`-prefixed prune would drop a
+			// subtree the matcher keeps. Withhold it; the per-entry post-filter still ignores the top-level
+			// instances correctly, just without the traversal shortcut. Anchored candidates are unaffected.
+			if (!anchored && negatedBasenames.has(relative.toLowerCase())) {
 				continue
 			}
 
