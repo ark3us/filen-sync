@@ -472,6 +472,35 @@ export class Sync {
 					}
 				}
 
+				// The exact local-side analog of the decrypt-error guard above. FastGlob scans the local tree with
+				// suppressErrors:true, so a transient readdir failure on one directory (EIO/EACCES/ENOTDIR — routine on
+				// SMB/NFS/removable media) silently omits that WHOLE subtree from the scan. Those items are then absent
+				// from the fresh tree, indistinguishable from a deletion, so the local-deletion pass would trash their
+				// synced CLOUD copies: silent data loss (the "files deleted / GBs missing after a network hiccup" field
+				// class). getDirectoryTree counts the failed enumerations as scanIncomplete; when >0 we re-assert every
+				// base local item still missing from this read at its last-known state, so no deletion is emitted. A
+				// genuine deletion simply waits for a clean scan (self-healing); a persistently-failing directory only
+				// ever blocks its own subtree's deletions, never causes a wrong one. The inode index is only re-pointed
+				// when the slot is free, so a readable item that legitimately reused the inode is never clobbered. Runs
+				// ONLY when a scan error occurred — zero cost on every healthy cycle.
+				if (currentLocalTree.scanIncomplete > 0) {
+					const current = currentLocalTree.result
+
+					for (const path in this.previousLocalTree.tree) {
+						const baseItem = this.previousLocalTree.tree[path]
+
+						if (baseItem && !current.tree[path]) {
+							current.tree[path] = baseItem
+
+							if (!current.inodes[baseItem.inode]) {
+								current.inodes[baseItem.inode] = baseItem
+							}
+
+							current.size += 1
+						}
+					}
+				}
+
 				clearTimeout(gettingTreesMessageTimeout)
 
 				postMessageToMain({
@@ -697,7 +726,8 @@ export class Sync {
 										inodes: {},
 										ignored: [],
 										errors: [],
-										size: 0
+										size: 0,
+										scanIncomplete: 0
 									}
 								}
 

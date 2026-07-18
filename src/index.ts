@@ -80,7 +80,8 @@ export class SyncWorker {
 				inodes: {},
 				ignored: [],
 				errors: [],
-				size: 0
+				size: 0,
+				scanIncomplete: 0
 			}
 
 			sync.remoteFileSystem.getDirectoryTreeCache = {

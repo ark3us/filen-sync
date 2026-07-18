@@ -42,6 +42,14 @@ export type VirtualFS = {
 		setError(path: string, error: NodeJS.ErrnoException): void
 		/** Remove a previously injected error for `path`. */
 		clearError(path: string): void
+		/**
+		 * Force `globFs.readdir(dirPath)` (the FastGlob scan enumeration) to fail with `error`, modelling a
+		 * transient network-share enumeration failure that silently omits `dirPath`'s subtree from the scan.
+		 * `dirPath` is the ABSOLUTE path the walk enumerates (e.g. "/local/photos/2020").
+		 */
+		setGlobReaddirError(dirPath: string, error: NodeJS.ErrnoException): void
+		/** Remove a previously injected glob-readdir error for `dirPath`. */
+		clearGlobReaddirError(dirPath: string): void
 		/** Remove all injected errors. */
 		clearAllErrors(): void
 		/**
@@ -203,6 +211,11 @@ export function createVirtualFS(initial: VfsSpec = {}, options: CreateVirtualFSO
 	// Forced inode numbers (posix path -> ino) so a test can reproduce ext4-style inode reuse, which
 	// memfs's allocator does not surface naturally.
 	const inodeOverrides = new Map<string, number>()
+	// Directories whose `globFs.readdir` should fail (posix path -> error), modelling a transient
+	// enumeration failure on a network share (EIO/EACCES) that FastGlob's suppressErrors swallows — the
+	// only way to reproduce a PARTIAL local scan (a subtree silently omitted) that the engine must not
+	// read as a mass deletion.
+	const globReaddirErrors = new Map<string, NodeJS.ErrnoException>()
 	// Optional one-shot-friendly hook fired after each lstat/stat returns, so a test can mutate a file
 	// mid-scan (after the engine read it) to reproduce a read-during-scan race deterministically.
 	let statHook: ((posixPath: string) => void) | null = null
@@ -392,8 +405,31 @@ export function createVirtualFS(initial: VfsSpec = {}, options: CreateVirtualFSO
 		lstatSync: (path: string, ...rest: unknown[]) => (ifs.lstatSync as (...args: unknown[]) => unknown)(toPosixPath(path), ...rest),
 		stat: (path: string, ...rest: unknown[]) => (ifs.stat as (...args: unknown[]) => unknown)(toPosixPath(path), ...rest),
 		statSync: (path: string, ...rest: unknown[]) => (ifs.statSync as (...args: unknown[]) => unknown)(toPosixPath(path), ...rest),
-		readdir: (path: string, ...rest: unknown[]) => (ifs.readdir as (...args: unknown[]) => unknown)(toPosixPath(path), ...rest),
-		readdirSync: (path: string, ...rest: unknown[]) => (ifs.readdirSync as (...args: unknown[]) => unknown)(toPosixPath(path), ...rest)
+		readdir: (path: string, ...rest: unknown[]) => {
+			const posix = toPosixPath(path)
+			const injected = globReaddirErrors.get(posix)
+			const callback = rest[rest.length - 1]
+
+			// FastGlob's async reader calls readdir callback-style; deliver the injected error via the callback
+			// exactly as a real failing readdir would, so suppressErrors swallows it and the subtree is omitted.
+			if (injected && typeof callback === "function") {
+				;(callback as (error: unknown) => void)(injected)
+
+				return
+			}
+
+			return (ifs.readdir as (...args: unknown[]) => unknown)(posix, ...rest)
+		},
+		readdirSync: (path: string, ...rest: unknown[]) => {
+			const posix = toPosixPath(path)
+			const injected = globReaddirErrors.get(posix)
+
+			if (injected) {
+				throw injected
+			}
+
+			return (ifs.readdirSync as (...args: unknown[]) => unknown)(posix, ...rest)
+		}
 	}
 
 	const controls: VirtualFS["controls"] = {
@@ -428,6 +464,12 @@ export function createVirtualFS(initial: VfsSpec = {}, options: CreateVirtualFSO
 		},
 		clearError: (path: string): void => {
 			errors.delete(resolvePath(path))
+		},
+		setGlobReaddirError: (dirPath: string, error: NodeJS.ErrnoException): void => {
+			globReaddirErrors.set(toPosixPath(dirPath), error)
+		},
+		clearGlobReaddirError: (dirPath: string): void => {
+			globReaddirErrors.delete(toPosixPath(dirPath))
 		},
 		clearAllErrors: (): void => {
 			errors.clear()

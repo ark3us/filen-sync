@@ -69,7 +69,8 @@ export function forceLocalRescan(world: World): void {
 		inodes: {},
 		ignored: [],
 		errors: [],
-		size: 0
+		size: 0,
+		scanIncomplete: 0
 	}
 }
 

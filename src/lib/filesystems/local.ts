@@ -23,7 +23,7 @@ import { type CloudItem, PauseSignal } from "@filen/sdk"
 import { postMessageToMain } from "../ipc"
 import { Semaphore } from "../../semaphore"
 import { v4 as uuidv4 } from "uuid"
-import { type SyncWatcher } from "../environment"
+import { type SyncWatcher, type SyncGlobFS } from "../environment"
 import FastGlob from "fast-glob"
 
 const pipelineAsync = promisify(pipeline)
@@ -152,13 +152,18 @@ export class LocalFileSystem {
 		ignored: LocalTreeIgnored[]
 		errors: LocalTreeError[]
 		size: number
+		// How many directory enumerations (readdir) FAILED during the scan. >0 means the walk is INCOMPLETE:
+		// a subtree was silently omitted (FastGlob's suppressErrors swallows the error), which the caller must
+		// NOT mistake for a deletion. Mirrors remote.ts's decryptErrors; sync.ts carries the base forward.
+		scanIncomplete: number
 	} = {
 		timestamp: 0,
 		tree: {},
 		inodes: {},
 		ignored: [],
 		errors: [],
-		size: 0
+		size: 0,
+		scanIncomplete: 0
 	}
 	public watcherRunning = false
 	private watcherInstance: SyncWatcher | null = null
@@ -283,12 +288,14 @@ export class LocalFileSystem {
 		errors: LocalTreeError[]
 		ignored: LocalTreeIgnored[]
 		changed: boolean
+		scanIncomplete: number
 	}> {
 		return new Promise<{
 			result: LocalTree
 			errors: LocalTreeError[]
 			ignored: LocalTreeIgnored[]
 			changed: boolean
+			scanIncomplete: number
 			// eslint-disable-next-line no-async-promise-executor
 		}>(async (resolve, reject) => {
 			try {
@@ -305,7 +312,8 @@ export class LocalFileSystem {
 						},
 						errors: this.getDirectoryTreeCache.errors,
 						ignored: this.getDirectoryTreeCache.ignored,
-						changed: false
+						changed: false,
+						scanIncomplete: this.getDirectoryTreeCache.scanIncomplete
 					})
 
 					return
@@ -316,6 +324,7 @@ export class LocalFileSystem {
 				this.getDirectoryTreeCache.ignored = []
 				this.getDirectoryTreeCache.errors = []
 				this.getDirectoryTreeCache.size = 0
+				this.getDirectoryTreeCache.scanIncomplete = 0
 
 				// Stamp the cache as of the moment the walk BEGINS, not when it ends. The freshness check above
 				// skips a rescan while `lastDirectoryChangeTimestamp < cache.timestamp`; a file edited DURING
@@ -332,6 +341,54 @@ export class LocalFileSystem {
 				// ignore matcher's set (Ignorer.globIgnorePatternsForTraversal), so they can never drop a path the
 				// matcher keeps; anything they miss is still caught by the per-entry filter below.
 				const traversalIgnoreGlobs = this.sync.ignorer.globIgnorePatternsForTraversal()
+				// Count directory-enumeration (readdir) failures so an INCOMPLETE walk is not read as a mass
+				// deletion. FastGlob's suppressErrors swallows a failing readdir and silently drops that whole
+				// subtree; a transient EIO/EACCES on a network share would otherwise make every file under the
+				// un-enumerable directory look deleted. We wrap only readdir (the enumeration) — per-entry lstat/
+				// access failures are already recorded as `ignored` below. The wrapper adds one predicate per
+				// readdir call (a handful per directory), never a per-file cost.
+				let scanIncomplete = 0
+				const globFs = this.sync.environment.globFs
+				const baseReaddir = globFs.readdir as ((...args: unknown[]) => unknown) | undefined
+				const baseReaddirSync = globFs.readdirSync as ((...args: unknown[]) => unknown) | undefined
+				const countingGlobFs = {
+					...globFs,
+					...(baseReaddir
+						? {
+								readdir: ((path: string, ...rest: unknown[]): unknown => {
+									const callback = rest[rest.length - 1]
+
+									if (typeof callback === "function") {
+										const wrapped = (error: NodeJS.ErrnoException | null, ...results: unknown[]): void => {
+											if (error) {
+												scanIncomplete++
+											}
+
+											;(callback as (error: NodeJS.ErrnoException | null, ...results: unknown[]) => void)(error, ...results)
+										}
+
+										return baseReaddir(path, ...rest.slice(0, -1), wrapped)
+									}
+
+									return baseReaddir(path, ...rest)
+								}) as SyncGlobFS["readdir"]
+						  }
+						: {}),
+					...(baseReaddirSync
+						? {
+								readdirSync: ((path: string, ...rest: unknown[]): unknown => {
+									try {
+										return baseReaddirSync(path, ...rest)
+									} catch (e) {
+										scanIncomplete++
+
+										throw e
+									}
+								}) as SyncGlobFS["readdirSync"]
+						  }
+						: {})
+				} as SyncGlobFS
+
 				const entries = await FastGlob.async("**/*", {
 					dot: true,
 					onlyDirectories: false,
@@ -340,7 +397,7 @@ export class LocalFileSystem {
 					cwd: this.sync.syncPair.localPath,
 					followSymbolicLinks: false,
 					deep: Infinity,
-					fs: this.sync.environment.globFs,
+					fs: countingGlobFs,
 					suppressErrors: true,
 					stats: false,
 					unique: false,
@@ -475,11 +532,16 @@ export class LocalFileSystem {
 
 				this.getDirectoryTreeCache.size = size
 				this.getDirectoryTreeCache.timestamp = scanStartedAt
+				this.getDirectoryTreeCache.scanIncomplete = scanIncomplete
 
-				// Clear old local file hashes that are not present anymore
-				for (const path in this.sync.localFileHashes) {
-					if (!this.getDirectoryTreeCache.tree[path]) {
-						delete this.sync.localFileHashes[path]
+				// Clear old local file hashes that are not present anymore. Skip this entirely when the scan was
+				// INCOMPLETE: a hash whose path was merely omitted by a failed enumeration must survive (dropping
+				// it would poison the md5 dedup and cause a spurious re-upload once the subtree re-appears).
+				if (scanIncomplete === 0) {
+					for (const path in this.sync.localFileHashes) {
+						if (!this.getDirectoryTreeCache.tree[path]) {
+							delete this.sync.localFileHashes[path]
+						}
 					}
 				}
 
@@ -491,7 +553,8 @@ export class LocalFileSystem {
 					},
 					errors: this.getDirectoryTreeCache.errors,
 					ignored: this.getDirectoryTreeCache.ignored,
-					changed: true
+					changed: true,
+					scanIncomplete
 				})
 			} catch (e) {
 				reject(e)
