@@ -3,7 +3,7 @@ import pathModule from "path"
 import type FilenSDK from "@filen/sdk"
 import { E2E_ENABLED, loginTestSDK, teardownTestSDK } from "./harness/account"
 import { withE2EWorld } from "./harness/world"
-import { settle, expectConverged } from "./harness/drive"
+import { settle, cycle, expectConverged, transferKinds } from "./harness/drive"
 import { snapshotRemoteReal } from "./harness/assert"
 import {
 	writeLocal,
@@ -268,6 +268,28 @@ describe.skipIf(!E2E_ENABLED)("E2E — twoWay conflict resolution", () => {
 			expect(remote["/b.txt"]).toMatchObject({ type: "file" })
 			expect(await readLocal(world, "a.txt")).toBe("LOCAL-MOD")
 			expect(await readLocal(world, "b.txt")).toBe("orig")
+		})
+	})
+
+	it("a bare mtime touch on a DOWNLOADED file is not re-uploaded (#19)", async () => {
+		await withE2EWorld({ sdk, mode: "twoWay" }, async world => {
+			// Seed the remote and let the engine DOWNLOAD it to local — the download now caches the file's md5.
+			await uploadRemote(world, "dl.txt", "downloaded-bytes")
+			await settle(world)
+			await expectConverged(world)
+
+			// A bare mtime touch: the bytes are identical, only the mtime moves (clearly newer than the base).
+			await setLocalMtime(world, "dl.txt", Date.now() + 120_000)
+
+			// The touch cycle must NOT re-upload the unchanged bytes — the cached download hash dedups the upload.
+			// Without the fix the downloaded file has no cached hash, so the md5 mismatch re-uploads the file.
+			const messages = await cycle(world)
+
+			expect(
+				transferKinds(messages).filter(op => op.startsWith("upload")),
+				"a bare touch on a downloaded file re-uploaded unchanged bytes"
+			).toEqual([])
+			expect(await readLocal(world, "dl.txt")).toBe("downloaded-bytes")
 		})
 	})
 

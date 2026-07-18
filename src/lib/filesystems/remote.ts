@@ -1232,6 +1232,21 @@ export class RemoteFileSystem {
 
 			this.sync.localFileSystem.itemsMutex.release()
 
+			// Cache the downloaded file's md5 under the SAME key the upload path uses, so a later bare mtime touch
+			// (same bytes) is recognised as unchanged by the dedup and NOT needlessly re-uploaded. Without it a
+			// downloaded file had no cached hash, so `md5 !== cache` (cache undefined) always fired an upload. This
+			// is bounded to actual downloads (not the per-cycle scan hot path), and the just-written bytes are still
+			// in the page cache, so the extra hash is cheap relative to the network transfer that preceded it. A
+			// hash failure must never fail the download — the dedup just misses and a later touch re-uploads once. (#19)
+			try {
+				this.sync.localFileHashes[relativePath] = await this.sync.localFileSystem.createFileHash({
+					relativePath,
+					algorithm: "md5"
+				})
+			} catch (e) {
+				this.sync.worker.logger.log("error", e, "filesystems.remote.download.cacheHash")
+			}
+
 			postMessageToMain({
 				type: "transfer",
 				syncPair: this.sync.syncPair,
