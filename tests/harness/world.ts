@@ -25,6 +25,12 @@ export type CreateWorldOptions = {
 	paused?: boolean
 	uuid?: string
 	filenIgnore?: string
+	/** Model a case-insensitive, case-preserving local volume (Windows NTFS / macOS APFS / SMB). */
+	caseInsensitive?: boolean
+	/** Model a volume that reports `ino: 0` for every file (many SMB / network mounts). */
+	inodeMode?: "stable" | "zero"
+	/** Add a deterministic sub-ms fraction to reported mtimes (real-fs precision memfs lacks). */
+	fractionalMtime?: boolean
 }
 
 export type World = {
@@ -83,7 +89,11 @@ export async function createWorld(options: CreateWorldOptions): Promise<World> {
 		localSpec[`${LOCAL_ROOT}/.filenignore`] = options.filenIgnore
 	}
 
-	const vfs = createVirtualFS(localSpec)
+	const vfs = createVirtualFS(localSpec, {
+		caseInsensitive: options.caseInsensitive ?? false,
+		inodeMode: options.inodeMode ?? "stable",
+		fractionalMtime: options.fractionalMtime ?? false
+	})
 	const cloud = createFakeCloud(options.initialRemote ?? {}, { localFs: vfs.fs })
 	const watcher = createManualWatcher()
 

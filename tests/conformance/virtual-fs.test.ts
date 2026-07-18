@@ -211,3 +211,113 @@ describe("virtual filesystem conformance", () => {
 		expect(virtualEntries).toEqual(realEntries)
 	})
 })
+
+/**
+ * Case-insensitive volume mode (Windows NTFS / macOS APFS / SMB). memfs is natively case-SENSITIVE; this mode
+ * resolves any engine-supplied path against the actually-stored casing so the suite can reproduce case
+ * divergences that a case-sensitive fake structurally cannot. Real-fs case behavior is host-dependent (Linux
+ * case-sensitive, macOS/Windows case-insensitive), so these assert the mode's CONTRACT directly rather than
+ * comparing to the host fs.
+ */
+describe("virtual-fs — case-insensitive volume mode", () => {
+	it("stats and reads a file through a DIFFERENT casing than it was created with", async () => {
+		const v = createVirtualFS({ "/root/Report.txt": "hello" }, { caseInsensitive: true })
+		const fs = v.fs as SyncFS
+
+		expect((await fs.stat("/root/report.txt")).size).toBe("hello".length)
+		expect((await fs.stat("/ROOT/REPORT.TXT")).size).toBe("hello".length)
+		expect((await fs.readFile("/root/report.txt", { encoding: "utf-8" })) as unknown as string).toBe("hello")
+		expect(await fs.pathExists("/root/report.TXT")).toBe(true)
+	})
+
+	it("resolves a case-differing PARENT directory to the stored one", async () => {
+		const v = createVirtualFS({ "/root/SEPA/index.html": "x" }, { caseInsensitive: true })
+		const fs = v.fs as SyncFS
+
+		// Whole-path fold: parent "sepa" resolves to the stored "SEPA".
+		expect((await fs.stat("/root/sepa/index.html")).size).toBe(1)
+		expect(await fs.pathExists("/ROOT/sepa/INDEX.html")).toBe(true)
+	})
+
+	it("writing a differently-cased path OVERWRITES the existing file and keeps its stored name", async () => {
+		const v = createVirtualFS({ "/root/data.txt": "old" }, { caseInsensitive: true })
+		const fs = v.fs as SyncFS
+
+		await fs.writeFile("/root/DATA.txt", "new")
+
+		// One file, still stored as the original casing, with the new content.
+		expect(Object.keys(v.vol.toJSON())).toEqual(["/root/data.txt"])
+		expect((await fs.readFile("/root/data.txt", { encoding: "utf-8" })) as unknown as string).toBe("new")
+	})
+
+	it("a case-ONLY rename re-cases the stored name (does not collapse onto the source)", async () => {
+		const v = createVirtualFS({ "/root/readme.txt": "doc" }, { caseInsensitive: true })
+		const fs = v.fs as SyncFS
+
+		await fs.rename("/root/readme.txt", "/root/README.txt")
+
+		expect(Object.keys(v.vol.toJSON())).toEqual(["/root/README.txt"])
+		expect((await fs.readFile("/root/readme.txt", { encoding: "utf-8" })) as unknown as string).toBe("doc")
+	})
+
+	it("a fast-glob scan returns the STORED casing (so the local tree is keyed by on-disk case)", async () => {
+		const v = createVirtualFS({ "/root/Photos/Holiday.JPG": "img" }, { caseInsensitive: true })
+
+		const entries = (
+			await FastGlob.async("**/*", {
+				cwd: "/root",
+				fs: v.globFs as FastGlob.FileSystemAdapter,
+				onlyFiles: false,
+				markDirectories: false
+			})
+		).sort()
+
+		expect(entries).toEqual(["Photos", "Photos/Holiday.JPG"])
+	})
+
+	it("is the identity on a case-sensitive volume (default) — two casings are two files", async () => {
+		const v = createVirtualFS({ "/root/a.txt": "one" }, { caseInsensitive: false })
+		const fs = v.fs as SyncFS
+
+		await fs.writeFile("/root/A.txt", "two")
+
+		expect(Object.keys(v.vol.toJSON()).sort()).toEqual(["/root/A.txt", "/root/a.txt"])
+	})
+})
+
+/**
+ * Real-filesystem TRAITS that memfs cannot produce natively but Windows / SMB volumes exhibit — the reason the
+ * Windows/SMB field bugs slipped past a purely-memfs suite. These assert each trait is faithfully modelled so
+ * the trait-matrix sweep can rely on it.
+ */
+describe("virtual-fs — SMB / real-fs trait modes", () => {
+	it("inodeMode 'zero' reports ino: 0 for every entry (SMB / network mounts)", async () => {
+		const v = createVirtualFS({ "/root/a.txt": "a", "/root/dir/b.txt": "b" }, { inodeMode: "zero" })
+		const fs = v.fs as SyncFS
+
+		expect((await fs.lstat("/root/a.txt")).ino).toBe(0)
+		expect((await fs.lstat("/root/dir/b.txt")).ino).toBe(0)
+		expect((await fs.stat("/root/dir")).ino).toBe(0)
+	})
+
+	it("default inodeMode is 'stable' — memfs's unique, stable inodes", async () => {
+		const v = createVirtualFS({ "/root/a.txt": "a", "/root/b.txt": "b" })
+		const fs = v.fs as SyncFS
+
+		const a = (await fs.lstat("/root/a.txt")).ino
+		const b = (await fs.lstat("/root/b.txt")).ino
+
+		expect(a).toBeGreaterThan(0)
+		expect(a).not.toBe(b)
+		expect((await fs.lstat("/root/a.txt")).ino).toBe(a) // stable across calls
+	})
+
+	it("fractionalMtime makes reported mtimes non-integer (real-fs sub-ms precision)", async () => {
+		const v = createVirtualFS({ "/root/f.txt": "x" }, { fractionalMtime: true })
+		const fs = v.fs as SyncFS
+
+		const mtimeMs = (await fs.lstat("/root/f.txt")).mtimeMs
+
+		expect(Number.isInteger(mtimeMs)).toBe(false)
+	})
+})

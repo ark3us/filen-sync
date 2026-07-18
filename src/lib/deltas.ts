@@ -828,6 +828,56 @@ export class Deltas {
 			currentLocalTree = rebaseLocalTreeAcrossRenames(currentLocalTree, remoteOriginatedRenames)
 		}
 
+		// Case-insensitive MATCHING (whole path). The backend is case-insensitive, so a path that differs only
+		// in casing between the local disk and the cloud is the SAME item. Every cross-tree lookup in the
+		// add / delete / modify / type-change passes below goes through `ciGet` so a case-only divergence
+		// (a fresh sync, cleared state, or a cross-device difference) never reads as present-here/absent-there
+		// and churns (endless upload / download / delete). The RENAME passes ABOVE stay case-SENSITIVE — they
+		// detect and propagate a real case-only rename (Category ZQ) and run first, claiming it via
+		// `pathsAdded`, so a genuine rename is handled before this folding ever applies. Each tree already holds
+		// at most one item per case-folded path (computeLocalCaseWinners + the remote build's dedup), so the
+		// fold is collision-free. The per-tree fold index is built LAZILY on the first exact miss and cached by
+		// the tree's map reference, so a settled cycle (every lookup an exact hit) builds nothing, and a rebased
+		// tree (new map) indexes fresh. `path.toLowerCase()` mirrors the whole-path fold both builders use.
+		//
+		// Gated OFF whenever a DIRECTORY-rename composition is in flight this cycle. A cross-side directory
+		// rename that also changes casing (or composes with one deeper in the same chain — Category XN) is
+		// converged by the add/delete passes as an exact-case delete-old + create-new of the renamed subtree;
+		// folding would see the old-case and new-case paths as the SAME item and suppress that convergence,
+		// leaving the two sides cased differently forever. Those cycles keep exact-case matching (their prior,
+		// correct behavior); the passive case-divergence this fold targets never coincides with a dir rename.
+		const foldCaseInsensitive = renamedLocalDirectories.length === 0 && renamedRemoteDirectories.length === 0
+		const foldIndexCache = new WeakMap<object, Map<string, string>>()
+		const ciGet = <T>(treeMap: Record<string, T>, path: string): T | undefined => {
+			const exact = treeMap[path]
+
+			if (exact !== undefined || !foldCaseInsensitive) {
+				return exact
+			}
+
+			let index = foldIndexCache.get(treeMap)
+
+			if (!index) {
+				index = new Map<string, string>()
+
+				for (const existingPath in treeMap) {
+					const lowercased = existingPath.toLowerCase()
+
+					// First occurrence wins — order-independent because each tree is already deduped to one item
+					// per case-folded path upstream, so at most one real path maps to each fold in practice.
+					if (!index.has(lowercased)) {
+						index.set(lowercased, existingPath)
+					}
+				}
+
+				foldIndexCache.set(treeMap, index)
+			}
+
+			const realPath = index.get(path.toLowerCase())
+
+			return realPath !== undefined ? treeMap[realPath] : undefined
+		}
+
 		// Local deletions
 		if (mode === "twoWay" || mode === "localToCloud") {
 			if (mode === "twoWay") {
@@ -836,8 +886,8 @@ export class Deltas {
 						continue
 					}
 
-					const previousLocalItem = previousLocalTree.tree[path]
-					const currentLocalItem = currentLocalTree.tree[path]
+					const previousLocalItem = ciGet(previousLocalTree.tree, path)
+					const currentLocalItem = ciGet(currentLocalTree.tree, path)
 
 					// If the item does not exist in the current tree but does in the previous one, it has been deleted.
 					// We also check if the previous inode does not exist in the current tree, and if so, we skip it (only in cloud -> local modes. It should always be deleted in local -> cloud modes if it exists remotely).
@@ -860,8 +910,8 @@ export class Deltas {
 						// the remote-additions pass downloads (resurrects) it locally. A newer modify always beats
 						// a delete, in either direction. (F7)
 						if (previousLocalItem.type === "file") {
-							const previousRemoteItem = previousRemoteTree.tree[path]
-							const currentRemoteItem = currentRemoteTree.tree[path]
+							const previousRemoteItem = ciGet(previousRemoteTree.tree, path)
+							const currentRemoteItem = ciGet(currentRemoteTree.tree, path)
 
 							if (
 								currentRemoteItem &&
@@ -879,7 +929,7 @@ export class Deltas {
 						// creates the new-type item locally. Extends modify-beats-delete (F7) to type changes — without
 						// it, a type-change racing a delete loses the new item on the real backend, where deleting the
 						// OLD type executes against the NEW-type item now at that path. (F7 — type change beats delete)
-						const remoteTypeChangedItem = currentRemoteTree.tree[path]
+						const remoteTypeChangedItem = ciGet(currentRemoteTree.tree, path)
 
 						if (remoteTypeChangedItem && remoteTypeChangedItem.type !== previousLocalItem.type) {
 							continue
@@ -910,8 +960,8 @@ export class Deltas {
 						continue
 					}
 
-					const currentLocalItem = currentLocalTree.tree[path]
-					const currentRemoteItem = currentRemoteTree.tree[path]
+					const currentLocalItem = ciGet(currentLocalTree.tree, path)
+					const currentRemoteItem = ciGet(currentRemoteTree.tree, path)
 
 					// If the item does not exist in the current local tree but does in the remote one, it needs to be deleted remotely in localToCloud mode.
 					if (!currentLocalItem && currentRemoteItem) {
@@ -957,8 +1007,8 @@ export class Deltas {
 						continue
 					}
 
-					const previousRemoteItem = previousRemoteTree.tree[path]
-					const currentRemoteItem = currentRemoteTree.tree[path]
+					const previousRemoteItem = ciGet(previousRemoteTree.tree, path)
+					const currentRemoteItem = ciGet(currentRemoteTree.tree, path)
 
 					// If the item does not exist in the current tree but does in the previous one, it has been deleted.
 					// We also check if the previous UUID does not exist in the current tree, and if so, we skip it (only in local -> cloud modes. It should always be deleted in cloud -> local modes if it exists locally).
@@ -981,8 +1031,8 @@ export class Deltas {
 						// confirm because no hash was stored — is NOT a modification, so the delete proceeds. The
 						// hash is an optional signal (older files carry none).
 						if (previousRemoteItem.type === "file") {
-							const previousLocalItem = previousLocalTree.tree[path]
-							const currentLocalItem = currentLocalTree.tree[path]
+							const previousLocalItem = ciGet(previousLocalTree.tree, path)
+							const currentLocalItem = ciGet(currentLocalTree.tree, path)
 
 							if (currentLocalItem && currentLocalItem.type === "file" && previousLocalItem) {
 								let localContentChanged = currentLocalItem.size !== previousLocalItem.size
@@ -1020,7 +1070,7 @@ export class Deltas {
 						// local side replaced this path with a DIFFERENT type since the base (file↔directory), that new
 						// item must win over the remote delete — skip it so the local-additions pass pushes the new-type
 						// item up. (F7 — type change beats delete)
-						const localTypeChangedItem = currentLocalTree.tree[path]
+						const localTypeChangedItem = ciGet(currentLocalTree.tree, path)
 
 						if (localTypeChangedItem && localTypeChangedItem.type !== previousRemoteItem.type) {
 							continue
@@ -1051,8 +1101,8 @@ export class Deltas {
 						continue
 					}
 
-					const currentLocalItem = currentLocalTree.tree[path]
-					const currentRemoteItem = currentRemoteTree.tree[path]
+					const currentLocalItem = ciGet(currentLocalTree.tree, path)
+					const currentRemoteItem = ciGet(currentRemoteTree.tree, path)
 
 					// If the item does not exist in the current remote tree but does in the local one, it needs to be deleted locally in cloudToLocal mode.
 					if (!currentRemoteItem && currentLocalItem) {
@@ -1170,16 +1220,16 @@ export class Deltas {
 					continue
 				}
 
-				const currentLocalItem = currentLocalTree.tree[path]
-				const currentRemoteItem = currentRemoteTree.tree[path]
+				const currentLocalItem = ciGet(currentLocalTree.tree, path)
+				const currentRemoteItem = ciGet(currentRemoteTree.tree, path)
 
 				if (!currentLocalItem || !currentRemoteItem || currentLocalItem.type === currentRemoteItem.type) {
 					continue
 				}
 
 				// Both sides have this path, with different types. Attribute the change against the base.
-				const previousLocalItem = previousLocalTree.tree[path]
-				const previousRemoteItem = previousRemoteTree.tree[path]
+				const previousLocalItem = ciGet(previousLocalTree.tree, path)
+				const previousRemoteItem = ciGet(previousRemoteTree.tree, path)
 				const localChangedType = !previousLocalItem || previousLocalItem.type !== currentLocalItem.type
 				const remoteChangedType = !previousRemoteItem || previousRemoteItem.type !== currentRemoteItem.type
 
@@ -1267,8 +1317,8 @@ export class Deltas {
 					continue
 				}
 
-				const currentLocalItem = currentLocalTree.tree[path]
-				const currentRemoteItem = currentRemoteTree.tree[path]
+				const currentLocalItem = ciGet(currentLocalTree.tree, path)
+				const currentRemoteItem = ciGet(currentRemoteTree.tree, path)
 
 				// If the item does not exist in the current remote tree, but does in the local one, it should be uploaded.
 				// We also check if it in fact has existed before (the inode), if so, we skip it (only in cloud -> local modes. It should always be uploaded in local -> cloud modes if it does not exist remotely).
@@ -1279,7 +1329,7 @@ export class Deltas {
 					//	? !previousLocalTree.inodes[currentLocalItem.inode]
 					//	: true) &&
 					// Does an item with the same path and type already exist in the current remote tree (probably uploaded by something else prior)?
-					!(currentRemoteTree.tree[path] && currentRemoteTree.tree[path]!.type === currentLocalItem.type)
+					!(ciGet(currentRemoteTree.tree, path) && ciGet(currentRemoteTree.tree, path)!.type === currentLocalItem.type)
 				) {
 					deltas.push({
 						type: currentLocalItem.type === "directory" ? "createRemoteDirectory" : "uploadFile",
@@ -1302,8 +1352,8 @@ export class Deltas {
 				// The md5 comparison stays as an OPTIONAL dedup (so a pure mtime touch with identical bytes is
 				// not re-uploaded) — never a required signal, since older files carry no stored hash.
 				if (currentRemoteItem && currentRemoteItem.type === "file" && currentLocalItem && currentLocalItem.type === "file") {
-					const previousLocalItem = previousLocalTree.tree[path]
-					const previousRemoteItem = previousRemoteTree.tree[path]
+					const previousLocalItem = ciGet(previousLocalTree.tree, path)
+					const previousRemoteItem = ciGet(previousRemoteTree.tree, path)
 					// With a persisted base, attribute the change against it (size + whole-second mtime). With
 					// NO base — a genuine first sync, or lost/corrupt state — there is no common ancestor, so
 					// the remote copy is the only reference: fall back to the side-vs-side comparison and treat
@@ -1403,8 +1453,8 @@ export class Deltas {
 					continue
 				}
 
-				const currentLocalItem = currentLocalTree.tree[path]
-				const currentRemoteItem = currentRemoteTree.tree[path]
+				const currentLocalItem = ciGet(currentLocalTree.tree, path)
+				const currentRemoteItem = ciGet(currentRemoteTree.tree, path)
 
 				// If the item does not exist in the current local tree, but does in the remote one, it should be downloaded.
 				// We also check if it in fact has existed before (the UUID), if so, we skip it (only in local -> cloud modes. It should always be downloaded in cloud -> local modes if it does not exist locally).
@@ -1415,7 +1465,7 @@ export class Deltas {
 					//	? !previousRemoteTree.uuids[currentRemoteItem.uuid]
 					//	: true) &&
 					// Does an item with the same path and type already exist in the current local tree (probably downloaded by something else prior)?
-					!(currentLocalTree.tree[path] && currentLocalTree.tree[path]!.type === currentRemoteItem.type)
+					!(ciGet(currentLocalTree.tree, path) && ciGet(currentLocalTree.tree, path)!.type === currentRemoteItem.type)
 				) {
 					// Don't re-create local content that would land under a structurally ignored/errored local path
 					// (a symlink-replaced FOLDER, an unreadable directory): a DESCENDANT behind such an ancestor, or
@@ -1443,7 +1493,7 @@ export class Deltas {
 					continue
 				}
 
-				const previousRemoteItem = previousRemoteTree.tree[path]
+				const previousRemoteItem = ciGet(previousRemoteTree.tree, path)
 
 				// If the item exists in both trees and the remote copy changed since the base, download it.
 				// This MIRRORS the local-additions modify branch. With a base the remote changed iff its uuid
@@ -1453,7 +1503,7 @@ export class Deltas {
 				// first and claimed the path (pathsAdded) when local won; reaching here means the remote wins.
 				// Without this no-base fallback an add-vs-add where the REMOTE is newer never converged. (F8)
 				if (currentRemoteItem && currentRemoteItem.type === "file" && currentLocalItem && currentLocalItem.type === "file") {
-					const previousLocalItem = previousLocalTree.tree[path]
+					const previousLocalItem = ciGet(previousLocalTree.tree, path)
 					const remoteChanged = previousRemoteItem
 						? currentRemoteItem.uuid !== previousRemoteItem.uuid
 						: normalizeLastModifiedMsForComparison(currentRemoteItem.lastModified) >

@@ -111,18 +111,93 @@ export function applyVfsSpec(ifs: IFs, spec: VfsSpec): void {
 	}
 }
 
+export type CreateVirtualFSOptions = {
+	/**
+	 * Model a CASE-INSENSITIVE, case-PRESERVING volume (Windows NTFS / macOS APFS / an SMB share) instead of
+	 * memfs's native posix case-SENSITIVITY. When on, any path the engine passes is resolved against the
+	 * actually-stored casing at each segment before it reaches memfs — so `stat("/local/INDEX.html")` finds a
+	 * file created as `/local/index.html`, and writing `/local/INDEX.html` over it OVERWRITES it while keeping
+	 * the stored name. A `readdir` (and therefore the glob scan) still returns the stored casing, so the local
+	 * tree is keyed by the on-disk case exactly as on a real device. A case-ONLY rename (`index.html` →
+	 * `Index.html`) still changes the stored casing (the destination leaf keeps its requested case). This is
+	 * what lets the suite reproduce case-divergence bugs that memfs (case-sensitive) structurally cannot.
+	 */
+	caseInsensitive?: boolean
+	/**
+	 * Model a volume that does not expose stable per-file inodes. Many SMB / network mounts report `ino: 0`
+	 * (or a value that is not stable across a remount) for every entry — memfs always hands out unique, stable
+	 * inodes, so the engine's inode-based rename/identity detection is never exercised against this reality
+	 * without it. `"zero"` forces every stat/lstat to report `ino: 0`.
+	 */
+	inodeMode?: "stable" | "zero"
+	/**
+	 * Add a deterministic sub-millisecond fraction to every reported `mtimeMs` (both stat and lstat), modelling
+	 * the fractional precision a real filesystem returns (NTFS 100ns, ext4/APFS ns) that memfs's integer-ms
+	 * clock does not. Exercises the engine's whole-second mtime normalization against non-integer inputs.
+	 */
+	fractionalMtime?: boolean
+}
+
 /**
  * Create an in-memory filesystem that satisfies the engine's {@link SyncFS} and
  * {@link SyncGlobFS} contracts. Backed by memfs (battle-tested), with the
  * fs-extra conveniences the engine relies on (`ensureDir`, `exists`,
  * `pathExists`, `move`) layered on top, plus a per-path error-injection map for
- * resilience tests.
+ * resilience tests. Pass `{ caseInsensitive: true }` to model a Windows/macOS/SMB volume.
  */
-export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
+export function createVirtualFS(initial: VfsSpec = {}, options: CreateVirtualFSOptions = {}): VirtualFS {
 	const vol = new Volume()
 	const ifs = createFsFromVolume(vol)
+	const caseInsensitive = options.caseInsensitive ?? false
+	const inodeMode = options.inodeMode ?? "stable"
+	const fractionalMtime = options.fractionalMtime ?? false
 
 	applyVfsSpec(ifs, initial)
+
+	// Resolve a posix path against the ACTUALLY-STORED casing, segment by segment, on a case-insensitive
+	// volume: at each level read the parent's real entries and match case-insensitively, so a differently-cased
+	// path lands on the existing file/dir. A segment with no case-insensitive match keeps its requested casing
+	// (a not-yet-created leaf or ancestor). On a case-sensitive volume this is the identity. `keepLeafCase`
+	// preserves the final segment's requested casing even when it case-insensitively matches an existing entry
+	// — used for a rename/move DESTINATION so a case-only rename actually re-cases the stored name.
+	const resolveStored = (posixPath: string, keepLeafCase = false): string => {
+		if (!caseInsensitive) {
+			return posixPath
+		}
+
+		const segments = posixPath.split("/").filter(segment => segment.length > 0)
+		let stored = ""
+
+		for (let i = 0; i < segments.length; i++) {
+			const segment = segments[i]!
+			const isLeaf = i === segments.length - 1
+
+			if (keepLeafCase && isLeaf) {
+				stored = `${stored}/${segment}`
+
+				continue
+			}
+
+			let entries: string[]
+
+			try {
+				entries = vol.readdirSync(stored === "" ? "/" : stored) as string[]
+			} catch {
+				entries = []
+			}
+
+			const match = entries.find(entry => String(entry).toLowerCase() === segment.toLowerCase())
+
+			stored = `${stored}/${match !== undefined ? String(match) : segment}`
+		}
+
+		return stored === "" ? "/" : stored
+	}
+
+	// The single normalizer every fs method funnels its path(s) through: posix-normalize (host separators →
+	// memfs posix), then case-resolve against stored casing.
+	const resolvePath = <T>(path: T, keepLeafCase = false): T =>
+		(typeof path === "string" ? resolveStored(toPosixPath(path), keepLeafCase) : path) as T
 
 	const errors = new Map<string, NodeJS.ErrnoException>()
 	// Forced inode numbers (posix path -> ino) so a test can reproduce ext4-style inode reuse, which
@@ -143,18 +218,44 @@ export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
 
 	const promises = ifs.promises
 
+	// Apply the configured volume traits to a raw memfs Stats: inode model (SMB `ino: 0`), a per-path inode
+	// override (ext4-reuse tests), and a fractional-mtime component (real-fs sub-ms precision). Mutates and
+	// returns the same Stats object.
+	type MutableStats = { ino: number; mtimeMs: number; mtime: Date }
+	const applyStatTraits = (stats: MutableStats, path: string): MutableStats => {
+		if (inodeMode === "zero") {
+			stats.ino = 0
+		}
+
+		const overriddenInode = inodeOverrides.get(path)
+
+		if (overriddenInode !== undefined) {
+			stats.ino = overriddenInode
+		}
+
+		let mtimeMs = stats.mtimeMs
+
+		// A fixed, deterministic fraction — enough to be non-integer, small enough never to cross a whole
+		// second on its own (so it only ever exercises the flooring, never shifts the second).
+		if (fractionalMtime) {
+			mtimeMs += 0.4482
+		}
+
+		if (mtimeMs !== stats.mtimeMs) {
+			stats.mtimeMs = mtimeMs
+			stats.mtime = new Date(mtimeMs)
+		}
+
+		return stats
+	}
+
 	const fs = {
 		constants: ifs.constants,
 		stat: async (path: string) => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
-			const stats = await promises.stat(path)
-			const overriddenInode = inodeOverrides.get(path)
-
-			if (overriddenInode !== undefined) {
-				stats.ino = overriddenInode
-			}
+			const stats = applyStatTraits((await promises.stat(path)) as unknown as MutableStats, path)
 
 			if (statHook) {
 				statHook(path)
@@ -163,15 +264,10 @@ export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
 			return stats
 		},
 		lstat: async (path: string) => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
-			const stats = await promises.lstat(path)
-			const overriddenInode = inodeOverrides.get(path)
-
-			if (overriddenInode !== undefined) {
-				stats.ino = overriddenInode
-			}
+			const stats = applyStatTraits((await promises.lstat(path)) as unknown as MutableStats, path)
 
 			if (statHook) {
 				statHook(path)
@@ -180,14 +276,14 @@ export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
 			return stats
 		},
 		access: async (path: string, mode?: number) => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
 			return await promises.access(path, mode)
 		},
 		exists: async (path: string): Promise<boolean> => {
 			try {
-				path = toPosixPath(path)
+				path = resolvePath(path)
 				guard(path)
 
 				await promises.access(path)
@@ -199,7 +295,7 @@ export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
 		},
 		pathExists: async (path: string): Promise<boolean> => {
 			try {
-				path = toPosixPath(path)
+				path = resolvePath(path)
 				guard(path)
 
 				await promises.access(path)
@@ -210,13 +306,13 @@ export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
 			}
 		},
 		ensureDir: async (path: string): Promise<void> => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
 			await promises.mkdir(path, { recursive: true })
 		},
 		mkdir: async (path: string, options?: { recursive?: boolean }) => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
 			return await promises.mkdir(path, options)
@@ -225,21 +321,22 @@ export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
 			path: string,
 			options?: { force?: boolean; maxRetries?: number; recursive?: boolean; retryDelay?: number }
 		): Promise<void> => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
 			await promises.rm(path, options)
 		},
 		rename: async (src: string, dest: string): Promise<void> => {
-			src = toPosixPath(src)
-			dest = toPosixPath(dest)
+			src = resolvePath(src)
+			// keepLeafCase: a case-only rename must re-case the stored leaf, not resolve back onto the source.
+			dest = resolvePath(dest, true)
 			guard(src)
 
 			await promises.rename(src, dest)
 		},
 		move: async (src: string, dest: string, options?: { overwrite?: boolean }): Promise<void> => {
-			src = toPosixPath(src)
-			dest = toPosixPath(dest)
+			src = resolvePath(src)
+			dest = resolvePath(dest, true)
 			guard(src)
 
 			await promises.mkdir(pathModule.posix.dirname(dest), { recursive: true })
@@ -255,31 +352,31 @@ export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
 			await promises.rename(src, dest)
 		},
 		utimes: async (path: string, atime: number | Date, mtime: number | Date): Promise<void> => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
 			await promises.utimes(path, atime, mtime)
 		},
 		readFile: async (path: string, options?: { encoding?: BufferEncoding }) => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
 			return await promises.readFile(path, options)
 		},
 		writeFile: async (path: string, data: string | Uint8Array, options?: { encoding?: BufferEncoding }): Promise<void> => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
 			await promises.writeFile(path, data, options)
 		},
 		createReadStream: (path: string, options?: Parameters<IFs["createReadStream"]>[1]) => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
 			return ifs.createReadStream(path, options)
 		},
 		createWriteStream: (path: string, options?: Parameters<IFs["createWriteStream"]>[1]) => {
-			path = toPosixPath(path)
+			path = resolvePath(path)
 			guard(path)
 
 			return ifs.createWriteStream(path, options)
@@ -300,20 +397,20 @@ export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
 	}
 
 	const controls: VirtualFS["controls"] = {
-		// Every path-keyed control normalizes with toPosixPath, exactly as the fs methods do before they
-		// consult these maps. Tests pass either posix literals (a no-op here) or engine-computed paths,
-		// which on Windows carry host backslash separators — without this an injected key would never
-		// match the posix path the engine actually stats/opens.
+		// Every path-keyed control normalizes with resolvePath, exactly as the fs methods do before they
+		// consult these maps: posix-normalize (host separators → memfs posix) and, on a case-insensitive
+		// volume, resolve against the stored casing — so an injected key matches the path the engine actually
+		// stats/opens regardless of the casing the test wrote. On a case-sensitive volume this is the identity.
 		getInode: (path: string): number | null => {
 			try {
-				return Number(vol.statSync(toPosixPath(path)).ino)
+				return Number(vol.statSync(resolvePath(path)).ino)
 			} catch {
 				return null
 			}
 		},
 		exists: (path: string): boolean => {
 			try {
-				vol.statSync(toPosixPath(path))
+				vol.statSync(resolvePath(path))
 
 				return true
 			} catch {
@@ -321,16 +418,16 @@ export function createVirtualFS(initial: VfsSpec = {}): VirtualFS {
 			}
 		},
 		setInode: (path: string, ino: number): void => {
-			inodeOverrides.set(toPosixPath(path), ino)
+			inodeOverrides.set(resolvePath(path), ino)
 		},
 		clearInode: (path: string): void => {
-			inodeOverrides.delete(toPosixPath(path))
+			inodeOverrides.delete(resolvePath(path))
 		},
 		setError: (path: string, error: NodeJS.ErrnoException): void => {
-			errors.set(toPosixPath(path), error)
+			errors.set(resolvePath(path), error)
 		},
 		clearError: (path: string): void => {
-			errors.delete(toPosixPath(path))
+			errors.delete(resolvePath(path))
 		},
 		clearAllErrors: (): void => {
 			errors.clear()
