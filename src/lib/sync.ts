@@ -17,6 +17,18 @@ import { v4 as uuidv4 } from "uuid"
 import FastGlob from "fast-glob"
 
 /**
+ * Normalize a user-supplied large-deletion threshold (absolute number of deletions at which the
+ * confirmation prompt fires). Only a whole number >= 1 is honored; everything else (0, negative,
+ * fractional, NaN, Infinity, wrong type — it comes from a config file we do not control) falls back to
+ * `undefined`, i.e. the default "the deletions would wipe out the whole previously-known tree" rule.
+ * The fallback is deliberately the SAFE direction: a malformed value must never silently disable the
+ * gate, and a 0/negative one would prompt on every single deleted file until the user gave up on it.
+ */
+export function normalizeLargeDeletionThreshold(value?: number): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined
+}
+
+/**
  * Sync
  *
  * @export
@@ -61,6 +73,7 @@ export class Sync {
 	public cleanupLocalTrashInterval: ReturnType<typeof setInterval> | undefined = undefined
 	public isPreviousSavedTreeStateEmpty: boolean = true
 	public requireConfirmationOnLargeDeletion: boolean
+	public largeDeletionThreshold: number | undefined
 	public deletionConfirmationResult: "delete" | "restart" | "waiting" = "waiting"
 
 	/**
@@ -84,6 +97,7 @@ export class Sync {
 		this.localTrashDisabled = syncPair.localTrashDisabled
 		this.requireConfirmationOnLargeDeletion =
 			typeof syncPair.requireConfirmationOnLargeDeletion === "boolean" ? syncPair.requireConfirmationOnLargeDeletion : false
+		this.largeDeletionThreshold = normalizeLargeDeletionThreshold(syncPair.largeDeletionThreshold)
 		this.localFileSystem = new LocalFileSystem(this)
 		this.remoteFileSystem = new RemoteFileSystem(this)
 		this.deltas = new Deltas(this)
@@ -608,18 +622,35 @@ export class Sync {
 						syncPair: this.syncPair
 					})
 
+					// Items this cycle would delete on each side. RAW counts (pre-collapse): rename/move detection
+					// already decremented them, but nothing downstream can quietly shrink them below the gate.
+					const remoteDeleteCount = deleteRemoteDirectoryCountRaw + deleteRemoteFileCountRaw
+					const localDeleteCount = deleteLocalDirectoryCountRaw + deleteLocalFileCountRaw
+
+					// The count at which we ask. A configured threshold is an ABSOLUTE number of deletions;
+					// unset it falls back to the previous tree's size, i.e. the original rule ("everything we
+					// knew about is being deleted"). The original also required the side to be EMPTY now; that
+					// is dropped, so a cycle that deletes the whole known tree AND creates new items still
+					// prompts. Deliberate and in the safe direction — it is still a full wipe of everything the
+					// pair had synced. A threshold below the tree size is the whole point of the setting, so
+					// the emptiness check could not survive anyway.
+					const threshold = this.largeDeletionThreshold
+					const localDeletionTrigger = threshold ?? this.previousLocalTree.size
+					const remoteDeletionTrigger = threshold ?? this.previousRemoteTree.size
+
+					// Deletions APPLIED REMOTELY, caused by items vanishing LOCALLY — hence `where: "local"` and
+					// the local tree as the reference size. `previousTree.size > 0` keeps a never-yet-scanned
+					// pair (no base) from prompting on its first cycle.
 					const confirmLocalDeletion =
 						this.previousLocalTree.size > 0 &&
-						currentLocalTree.result.size === 0 &&
-						deleteRemoteDirectoryCountRaw + deleteRemoteFileCountRaw > 0 &&
-						this.previousLocalTree.size <= deleteRemoteDirectoryCountRaw + deleteRemoteFileCountRaw &&
+						remoteDeleteCount > 0 &&
+						remoteDeleteCount >= localDeletionTrigger &&
 						(cycleMode === "twoWay" || cycleMode === "localToCloud")
 
 					const confirmRemoteDeletion =
 						this.previousRemoteTree.size > 0 &&
-						currentRemoteTree.result.size === 0 &&
-						deleteLocalDirectoryCountRaw + deleteLocalFileCountRaw > 0 &&
-						this.previousRemoteTree.size <= deleteLocalDirectoryCountRaw + deleteLocalFileCountRaw &&
+						localDeleteCount > 0 &&
+						localDeleteCount >= remoteDeletionTrigger &&
 						(cycleMode === "twoWay" || cycleMode === "cloudToLocal")
 
 					let skipSyncDueToConfirmDeletionRestart = false
@@ -646,7 +677,13 @@ export class Sync {
 											? currentLocalTree.result.size + currentRemoteTree.result.size
 											: confirmLocalDeletion
 											? currentLocalTree.result.size
-											: currentRemoteTree.result.size
+											: currentRemoteTree.result.size,
+									count:
+										confirmLocalDeletion && confirmRemoteDeletion
+											? remoteDeleteCount + localDeleteCount
+											: confirmLocalDeletion
+											? remoteDeleteCount
+											: localDeleteCount
 								}
 							})
 						}

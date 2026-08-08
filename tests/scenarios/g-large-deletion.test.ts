@@ -274,4 +274,61 @@ describe("Category G — large-deletion confirmation", () => {
 			}
 		)
 	})
+
+	// G8/G9 — `largeDeletionThreshold`: an absolute number of deletions that arms the same gate BELOW a
+	// full wipe. G5 above is the control (no threshold configured, partial deletion, no prompt).
+	it("G8: a partial deletion at or above the configured threshold prompts, and restart applies nothing", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 2,
+				initialLocal: { "/local/a.txt": "a", "/local/b.txt": "b", "/local/c.txt": "c", "/local/d.txt": "d" }
+			},
+			async world => {
+				await plainCycle(world)
+
+				rmLocal(world, "a.txt")
+				rmLocal(world, "b.txt")
+				world.triggerWatcher()
+
+				await cycleWithDecision(world, "restart")
+
+				const prompts = messagesOfType(world.messages, "confirmDeletion")
+
+				expect(prompts.length).toBeGreaterThan(0)
+				expect(prompts[0]!.data.where).toBe("local")
+				// The side is NOT empty here, so `count` is what tells the user how much is at stake.
+				expect(prompts[0]!.data.count).toBe(2)
+				// "restart" — nothing was deleted remotely, not even the sub-threshold rest of the cycle.
+				expect(snapshotRemote(world)["/a.txt"]).toMatchObject({ type: "file" })
+				expect(snapshotRemote(world)["/b.txt"]).toMatchObject({ type: "file" })
+			}
+		)
+	})
+
+	it("G9: a deletion below the configured threshold syncs through without prompting", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 3,
+				initialLocal: { "/local/a.txt": "a", "/local/b.txt": "b", "/local/c.txt": "c", "/local/d.txt": "d" }
+			},
+			async world => {
+				await plainCycle(world)
+
+				rmLocal(world, "a.txt")
+				rmLocal(world, "b.txt")
+				world.triggerWatcher()
+
+				await plainCycle(world)
+
+				expect(confirmDeletionCount(world)).toBe(0)
+				expect(snapshotRemote(world)["/a.txt"]).toBeUndefined()
+				expect(snapshotRemote(world)["/b.txt"]).toBeUndefined()
+				expect(snapshotRemote(world)["/c.txt"]).toMatchObject({ type: "file" })
+			}
+		)
+	})
 })

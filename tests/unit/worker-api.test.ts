@@ -181,6 +181,29 @@ describe("SyncWorker public API — per-pair control methods", () => {
 		})
 	})
 
+	it("updateLargeDeletionThreshold honors whole numbers >= 1 and falls back to undefined for anything else", async () => {
+		await withWorld({ mode: "twoWay" }, async world => {
+			const uuid = world.syncPair.uuid
+
+			expect(world.sync.largeDeletionThreshold).toBeUndefined()
+
+			world.worker.updateLargeDeletionThreshold("not-this-pair", 50)
+			expect(world.sync.largeDeletionThreshold).toBeUndefined()
+
+			world.worker.updateLargeDeletionThreshold(uuid, 50)
+			expect(world.sync.largeDeletionThreshold).toBe(50)
+
+			// Garbage from a hand-edited config must fall back to the default rule (undefined), never to a
+			// value that would prompt on every deletion (0/negative) or disable the gate.
+			for (const bad of [0, -1, 1.5, NaN, Infinity, undefined, "10" as unknown as number]) {
+				world.worker.updateLargeDeletionThreshold(uuid, 50)
+				world.worker.updateLargeDeletionThreshold(uuid, bad)
+
+				expect(world.sync.largeDeletionThreshold, `rejects ${String(bad)}`).toBeUndefined()
+			}
+		})
+	})
+
 	it("fetchIgnorerContent returns the matching pair's ignorer content and an empty string for an unknown uuid", async () => {
 		await withWorld({ mode: "twoWay" }, async world => {
 			const uuid = world.syncPair.uuid

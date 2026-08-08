@@ -1,5 +1,5 @@
 import { type SyncPair, type SyncMessage, type SyncMode } from "./types"
-import Sync from "./lib/sync"
+import Sync, { normalizeLargeDeletionThreshold } from "./lib/sync"
 import FilenSDK, { type FilenSDKConfig } from "@filen/sdk"
 import { Semaphore } from "./semaphore"
 import { SYNC_INTERVAL } from "./constants"
@@ -279,6 +279,20 @@ export class SyncWorker {
 		for (const syncUUID in this.syncs) {
 			if (syncUUID === uuid) {
 				this.syncs[syncUUID]!.requireConfirmationOnLargeDeletion = requireConfirmationOnLargeDeletion
+
+				break
+			}
+		}
+	}
+
+	/**
+	 * Set the absolute number of deletions at which the confirmation prompt fires. Pass undefined (or an
+	 * invalid value) to restore the default "the whole previously-known tree would be deleted" rule.
+	 */
+	public updateLargeDeletionThreshold(uuid: string, largeDeletionThreshold?: number): void {
+		for (const syncUUID in this.syncs) {
+			if (syncUUID === uuid) {
+				this.syncs[syncUUID]!.largeDeletionThreshold = normalizeLargeDeletionThreshold(largeDeletionThreshold)
 
 				break
 			}

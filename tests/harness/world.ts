@@ -22,6 +22,8 @@ export type CreateWorldOptions = {
 	excludeDotFiles?: boolean
 	localTrashDisabled?: boolean
 	requireConfirmationOnLargeDeletion?: boolean
+	/** Absolute number of deletions that triggers the confirmation prompt (unset = the whole tree). */
+	largeDeletionThreshold?: number
 	paused?: boolean
 	uuid?: string
 	filenIgnore?: string
@@ -123,7 +125,9 @@ export async function createWorld(options: CreateWorldOptions): Promise<World> {
 		excludeDotFiles: options.excludeDotFiles ?? false,
 		paused: options.paused ?? false,
 		localTrashDisabled: options.localTrashDisabled ?? false,
-		requireConfirmationOnLargeDeletion: options.requireConfirmationOnLargeDeletion ?? false
+		requireConfirmationOnLargeDeletion: options.requireConfirmationOnLargeDeletion ?? false,
+		// Conditional spread, not an explicit `undefined`: exactOptionalPropertyTypes forbids the latter.
+		...(options.largeDeletionThreshold === undefined ? {} : { largeDeletionThreshold: options.largeDeletionThreshold })
 	}
 
 	const worker = new SyncWorker({
