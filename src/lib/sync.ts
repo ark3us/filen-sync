@@ -627,16 +627,18 @@ export class Sync {
 					const remoteDeleteCount = deleteRemoteDirectoryCountRaw + deleteRemoteFileCountRaw
 					const localDeleteCount = deleteLocalDirectoryCountRaw + deleteLocalFileCountRaw
 
-					// The count at which we ask. A configured threshold is an ABSOLUTE number of deletions;
-					// unset it falls back to the previous tree's size, i.e. the original rule ("everything we
-					// knew about is being deleted"). The original also required the side to be EMPTY now; that
-					// is dropped, so a cycle that deletes the whole known tree AND creates new items still
-					// prompts. Deliberate and in the safe direction — it is still a full wipe of everything the
-					// pair had synced. A threshold below the tree size is the whole point of the setting, so
-					// the emptiness check could not survive anyway.
-					const threshold = this.largeDeletionThreshold
-					const localDeletionTrigger = threshold ?? this.previousLocalTree.size
-					const remoteDeletionTrigger = threshold ?? this.previousRemoteTree.size
+					// The count at which we ask. The base rule is the previous tree's size ("everything we knew
+					// about is being deleted"); a configured threshold is an ABSOLUTE number of deletions that
+					// can only LOWER that bar, never raise it — min(), not ??. A threshold of 500 on a 10-item
+					// pair must not mean "wiping this pair is fine", which is exactly what a plain override
+					// would have meant: the wipe guarantee is the feature the setting refines, not one it may
+					// switch off. The original rule also required the side to be EMPTY now; that is dropped,
+					// since a threshold below the tree size could never satisfy it. Consequence on the default
+					// path: a cycle that deletes the whole known tree AND creates new items now prompts too —
+					// deliberate, and in the safe direction.
+					const threshold = this.largeDeletionThreshold ?? Infinity
+					const localDeletionTrigger = Math.min(threshold, this.previousLocalTree.size)
+					const remoteDeletionTrigger = Math.min(threshold, this.previousRemoteTree.size)
 
 					// Deletions APPLIED REMOTELY, caused by items vanishing LOCALLY — hence `where: "local"` and
 					// the local tree as the reference size. `previousTree.size > 0` keeps a never-yet-scanned

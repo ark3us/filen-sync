@@ -307,6 +307,60 @@ describe("Category G — large-deletion confirmation", () => {
 		)
 	})
 
+	// G10 — the threshold may only LOWER the bar. A threshold larger than the pair itself must not make a
+	// full wipe pass unannounced (it would silently disable the very guarantee the setting refines).
+	it("G10: a threshold above the tree size still prompts on a full wipe", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 500,
+				initialLocal: { "/local/a.txt": "a", "/local/b.txt": "b" }
+			},
+			async world => {
+				await plainCycle(world)
+
+				rmLocal(world, "a.txt")
+				rmLocal(world, "b.txt")
+				world.triggerWatcher()
+
+				await cycleWithDecision(world, "restart")
+
+				expect(confirmDeletionCount(world)).toBeGreaterThan(0)
+				expect(snapshotRemote(world)["/a.txt"]).toMatchObject({ type: "file" })
+			}
+		)
+	})
+
+	// G11 — the remote side of the gate takes the threshold too (symmetric with G8).
+	it("G11: remote deletions at the configured threshold prompt with where=remote", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 2,
+				initialRemote: { "/a.txt": "a", "/b.txt": "b", "/c.txt": "c", "/d.txt": "d" }
+			},
+			async world => {
+				await plainCycle(world)
+
+				world.cloud.controls.trashPath("/a.txt")
+				world.cloud.controls.trashPath("/b.txt")
+
+				await cycleWithDecision(world, "restart")
+
+				const prompts = messagesOfType(world.messages, "confirmDeletion")
+
+				expect(prompts.length).toBeGreaterThan(0)
+				expect(prompts[0]!.data.where).toBe("remote")
+				expect(prompts[0]!.data.count).toBe(2)
+				// "restart" — the local copies were not trashed.
+				expect(snapshotLocal(world)["/a.txt"]).toMatchObject({ type: "file" })
+				expect(snapshotLocal(world)["/b.txt"]).toMatchObject({ type: "file" })
+			}
+		)
+	})
+
 	it("G9: a deletion below the configured threshold syncs through without prompting", async () => {
 		await withWorld(
 			{
