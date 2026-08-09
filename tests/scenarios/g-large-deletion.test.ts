@@ -6,12 +6,13 @@ import { rmLocal, writeLocal } from "../harness/mutations"
 
 /**
  * Category G — large-deletion confirmation (behavioral spec §G, §6). When
- * requireConfirmationOnLargeDeletion is set and an entire side is emptied, the engine emits a
- * `confirmDeletion` prompt every second and blocks the cycle until `confirmDeletion(uuid, decision)`
- * arrives. "delete" proceeds; "restart" (or timeout) skips the cycle's deletions.
+ * requireConfirmationOnLargeDeletion is set and a cycle would delete more than the pair's threshold
+ * allows (by default: everything it has synced), the engine posts a `confirmDeletion` prompt, defers
+ * the gated deletions and finishes the cycle. The answer from `confirmDeletion(uuid, decision)` is
+ * consumed by a LATER cycle: "delete" applies the deletions if the set still matches what was shown,
+ * "restart" leaves them deferred and the prompt returns.
  *
- * These cycles block mid-run on the prompt, so they are driven manually (not via runScenario): the
- * timer pump below both fires the 1s prompt interval and delivers the user's decision.
+ * Cycles are driven manually here (not via runScenario) because a confirmation spans two of them.
  */
 const FAKE_TIMERS = ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] as const
 
@@ -35,24 +36,17 @@ async function plainCycle(world: World): Promise<void> {
 	await world.sync.runCycle()
 }
 
-/** Drive one cycle, delivering `decision` to any confirmation prompt so the cycle can complete. */
+/** Drive the two cycles a confirmation takes: one that prompts, one that applies `decision`. */
 async function cycleWithDecision(world: World, decision: "delete" | "restart"): Promise<void> {
+	// The gate does not block: the first cycle posts the prompt and defers the gated deletions, the
+	// answer is recorded, and the NEXT cycle consumes it (applying the deletions for "delete").
 	await vi.advanceTimersByTimeAsync(SYNC_INTERVAL + 1)
+	await world.sync.runCycle()
 
-	let settled = false
-	const cyclePromise = world.sync.runCycle().finally(() => {
-		settled = true
-	})
+	world.worker.confirmDeletion(world.syncPair.uuid, decision)
 
-	// The prompt resets the decision to "waiting" when it opens, so re-deliver each tick until the
-	// 1s interval observes it and the cycle moves on.
-	for (let tick = 0; tick < 30 && !settled; tick++) {
-		world.worker.confirmDeletion(world.syncPair.uuid, decision)
-
-		await vi.advanceTimersByTimeAsync(1000)
-	}
-
-	await cyclePromise
+	await vi.advanceTimersByTimeAsync(SYNC_INTERVAL + 1)
+	await world.sync.runCycle()
 }
 
 function confirmDeletionCount(world: World): number {
@@ -189,10 +183,11 @@ describe("Category G — large-deletion confirmation", () => {
 		)
 	})
 
-	// Drive a cycle that opens the confirmation prompt, then STOP the pair (pause/remove) mid-wait instead
-	// of answering. Returns whether the cycle settled — with the bail-out fix it does (the cycle skips and
-	// the finally releases the lock); without it the wait spins forever holding the lock. The tick loop is
-	// capped so a regression fails fast (settled === false) instead of hanging the suite.
+	// Drive a cycle that opens the confirmation prompt, then STOP the pair (pause/remove) without ever
+	// answering. Returns whether the cycle settled. Since the gate stopped blocking, settling is structural
+	// rather than a bail-out — these two keep guarding it: a cycle must never again end up waiting on a
+	// human while holding the account lock. The tick loop is capped so a regression fails fast
+	// (settled === false) instead of hanging the suite.
 	async function runCycleThenStopMidConfirmation(world: World, stop: (world: World) => void): Promise<boolean> {
 		await vi.advanceTimersByTimeAsync(SYNC_INTERVAL + 1)
 
@@ -461,6 +456,67 @@ describe("Category G — large-deletion confirmation", () => {
 				expect(snapshotRemote(world)["/a.txt"]).toBeUndefined()
 				expect(snapshotRemote(world)["/b.txt"]).toBeUndefined()
 				expect(snapshotRemote(world)["/c.txt"]).toMatchObject({ type: "file" })
+			}
+		)
+	})
+
+	// G15 — the approval is bound to WHAT WAS SHOWN. Between the prompt and the click the deletion set can
+	// grow; applying the old "yes" to the new set would delete more than the user agreed to.
+	it("G15: an approval does not apply to a deletion set that grew since the prompt", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 2,
+				initialLocal: {
+					"/local/a.txt": "a",
+					"/local/b.txt": "b",
+					"/local/c.txt": "c",
+					"/local/d.txt": "d",
+					"/local/e.txt": "e"
+				}
+			},
+			async world => {
+				await plainCycle(world)
+
+				rmLocal(world, "a.txt")
+				rmLocal(world, "b.txt")
+				world.triggerWatcher()
+
+				// Cycle 1 prompts for 2 deletions and defers them.
+				await plainCycle(world)
+
+				const prompts = messagesOfType(world.messages, "confirmDeletion")
+
+				expect(prompts.length).toBe(1)
+				expect(prompts[0]!.data.count).toBe(2)
+
+				// The user approves those 2 — but deletes two more files before the next cycle runs.
+				world.worker.confirmDeletion(world.syncPair.uuid, "delete")
+				rmLocal(world, "c.txt")
+				rmLocal(world, "d.txt")
+				world.triggerWatcher()
+
+				await plainCycle(world)
+
+				// The set is now 4, so the approval for 2 does not apply: nothing was deleted and the user is
+				// asked again, with the real number.
+				expect(snapshotRemote(world)["/a.txt"]).toMatchObject({ type: "file" })
+				expect(snapshotRemote(world)["/c.txt"]).toMatchObject({ type: "file" })
+
+				const reprompts = messagesOfType(world.messages, "confirmDeletion")
+
+				expect(reprompts.length).toBe(2)
+				expect(reprompts[1]!.data.count).toBe(4)
+
+				// Approving the set actually shown applies it.
+				world.worker.confirmDeletion(world.syncPair.uuid, "delete")
+
+				await plainCycle(world)
+
+				expect(snapshotRemote(world)["/a.txt"]).toBeUndefined()
+				expect(snapshotRemote(world)["/c.txt"]).toBeUndefined()
+				expect(snapshotRemote(world)["/e.txt"]).toMatchObject({ type: "file" })
 			}
 		)
 	})

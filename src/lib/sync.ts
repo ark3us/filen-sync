@@ -75,6 +75,13 @@ export class Sync {
 	public requireConfirmationOnLargeDeletion: boolean
 	public largeDeletionThreshold: number | undefined
 	public deletionConfirmationResult: "delete" | "restart" | "waiting" = "waiting"
+	/** Set of gated deletions the user was last asked about ("<side>:<count>"), null when nothing is pending. */
+	public promptedDeletionFingerprint: string | null = null
+	/** The set the user approved. Applied only if the next cycle's set still matches it, then cleared. */
+	public approvedDeletionFingerprint: string | null = null
+	/** Re-posted on cycles that end early, so the renderer's pending-deletion banner survives them. */
+	public lastConfirmDeletionMessage: { where: "local" | "remote" | "both"; previous: number; current: number; count: number } | null =
+		null
 
 	/**
 	 * Creates an instance of Sync.
@@ -552,11 +559,26 @@ export class Sync {
 						}
 					})
 
-					if (!currentLocalTree.changed && !currentRemoteTree.changed) {
-						postMessageToMain({
-							type: "cycleSuccess",
-							syncPair: this.syncPair
-						})
+					// An approved deletion must NOT wait for the next tree change: both trees are served from cache
+					// for up to LOCAL_RESCAN_SAFETY_INTERVAL, so bailing out here would leave the user's "yes"
+					// unapplied for up to a minute after the click. The cached trees are exactly the ones the
+					// prompt was computed from, so re-deriving the deltas from them reproduces the approved set.
+					if (!currentLocalTree.changed && !currentRemoteTree.changed && !this.approvedDeletionFingerprint) {
+						// A decision is still outstanding: re-post it so the renderer's banner survives this cycle
+						// (it clears the banner on cycleStarted), and do NOT report success over a pending mass
+						// deletion. This replaces the 1 Hz resend the blocking wait used to do.
+						if (this.promptedDeletionFingerprint && this.lastConfirmDeletionMessage) {
+							postMessageToMain({
+								type: "confirmDeletion",
+								syncPair: this.syncPair,
+								data: this.lastConfirmDeletionMessage
+							})
+						} else {
+							postMessageToMain({
+								type: "cycleSuccess",
+								syncPair: this.syncPair
+							})
+						}
 
 						postMessageToMain({
 							type: "cycleNoChanges",
@@ -657,60 +679,67 @@ export class Sync {
 
 					let deferGatedDeletions = false
 
-					// If the previous tree has nodes and the current one is empty, we should prompt the user to confirm deletion
+					// The gate ASKS, it does not WAIT. The cycle used to block here until a human clicked, holding
+					// the account lock the whole time — every other device on the account stalled for as long as
+					// the prompt went unanswered, and an ignored prompt stalled them forever. Deferring is now
+					// cheap and correct (only the gated deletions are held back), so the cycle posts the prompt,
+					// defers, and finishes; the answer is consumed by a later cycle.
 					if (this.requireConfirmationOnLargeDeletion && (confirmLocalDeletion || confirmRemoteDeletion)) {
-						this.deletionConfirmationResult = "waiting"
+						const where = confirmLocalDeletion && confirmRemoteDeletion ? "both" : confirmLocalDeletion ? "local" : "remote"
+						const count =
+							confirmLocalDeletion && confirmRemoteDeletion
+								? remoteDeleteCount + localDeleteCount
+								: confirmLocalDeletion
+								? remoteDeleteCount
+								: localDeleteCount
+						// An approval is bound to WHAT THE USER WAS SHOWN — the side and the number of items. If the
+						// deletion set grew (or moved to the other side) between the prompt and the click, the
+						// fingerprint no longer matches and the user is asked again rather than having their "yes"
+						// silently applied to a bigger deletion than the one they agreed to.
+						const fingerprint = `${where}:${count}`
 
-						const sendConfirmationMessage = () => {
+						if (this.approvedDeletionFingerprint === fingerprint) {
+							// One approval, one cycle: consumed here so a later, identical-looking deletion has to
+							// be confirmed on its own.
+							this.approvedDeletionFingerprint = null
+							this.promptedDeletionFingerprint = null
+							this.deletionConfirmationResult = "waiting"
+						} else {
+							// Any approval still on file was for a different set — drop it rather than carry it.
+							this.approvedDeletionFingerprint = null
+							this.promptedDeletionFingerprint = fingerprint
+							this.lastConfirmDeletionMessage = {
+								where,
+								previous:
+									confirmLocalDeletion && confirmRemoteDeletion
+										? this.previousLocalTree.size + this.previousRemoteTree.size
+										: confirmLocalDeletion
+										? this.previousLocalTree.size
+										: this.previousRemoteTree.size,
+								current:
+									confirmLocalDeletion && confirmRemoteDeletion
+										? currentLocalTree.result.size + currentRemoteTree.result.size
+										: confirmLocalDeletion
+										? currentLocalTree.result.size
+										: currentRemoteTree.result.size,
+								count
+							}
+
 							postMessageToMain({
 								type: "confirmDeletion",
 								syncPair: this.syncPair,
-								data: {
-									where:
-										confirmLocalDeletion && confirmRemoteDeletion ? "both" : confirmLocalDeletion ? "local" : "remote",
-									previous:
-										confirmLocalDeletion && confirmRemoteDeletion
-											? this.previousLocalTree.size + this.previousRemoteTree.size
-											: confirmLocalDeletion
-											? this.previousLocalTree.size
-											: this.previousRemoteTree.size,
-									current:
-										confirmLocalDeletion && confirmRemoteDeletion
-											? currentLocalTree.result.size + currentRemoteTree.result.size
-											: confirmLocalDeletion
-											? currentLocalTree.result.size
-											: currentRemoteTree.result.size,
-									count:
-										confirmLocalDeletion && confirmRemoteDeletion
-											? remoteDeleteCount + localDeleteCount
-											: confirmLocalDeletion
-											? remoteDeleteCount
-											: localDeleteCount
-								}
+								data: this.lastConfirmDeletionMessage
 							})
-						}
 
-						sendConfirmationMessage()
-
-						await new Promise<void>(resolve => {
-							const interval = setInterval(() => {
-								// Also bail when the pair is paused or removed while we wait — otherwise the cycle
-								// spins here indefinitely (the user may never answer) while HOLDING the lock, which
-								// starves every other device on the account. A bail-out leaves the decision as
-								// "waiting", so the skip-and-restart path below releases the lock and exits cleanly.
-								if (this.deletionConfirmationResult !== "waiting" || this.paused || this.removed) {
-									clearInterval(interval)
-
-									resolve()
-								} else {
-									sendConfirmationMessage()
-								}
-							}, 1000)
-						})
-
-						if (this.deletionConfirmationResult === "waiting" || this.deletionConfirmationResult === "restart") {
 							deferGatedDeletions = true
 						}
+					} else {
+						// The gate did not arm: whatever was pending is moot (the user restored the files, changed
+						// the mode, or raised the threshold). Clearing it stops cycleSuccess from being suppressed
+						// forever by a prompt nobody can answer any more.
+						this.promptedDeletionFingerprint = null
+						this.approvedDeletionFingerprint = null
+						this.lastConfirmDeletionMessage = null
 					}
 
 					// Declined (or unanswered / paused mid-wait): drop ONLY the deletions the gate is about and run

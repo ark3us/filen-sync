@@ -357,10 +357,20 @@ export class SyncWorker {
 		}
 	}
 
+	/**
+	 * Answer the pending large-deletion prompt. The answer is not awaited by a blocked cycle any more: it is
+	 * recorded here and consumed by the next cycle, which applies the deletions only if the set it computes
+	 * still matches the one the user was shown.
+	 */
 	public confirmDeletion(uuid: string, result: "delete" | "restart"): void {
 		for (const syncUUID in this.syncs) {
 			if (syncUUID === uuid) {
-				this.syncs[syncUUID]!.deletionConfirmationResult = result
+				const sync = this.syncs[syncUUID]!
+
+				sync.deletionConfirmationResult = result
+				// "delete" approves exactly the set the last prompt described; "restart" withdraws any approval
+				// (the deletions stay deferred and the prompt returns).
+				sync.approvedDeletionFingerprint = result === "delete" ? sync.promptedDeletionFingerprint : null
 
 				break
 			}
