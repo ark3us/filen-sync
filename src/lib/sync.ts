@@ -731,10 +731,36 @@ export class Sync {
 							...(confirmLocalDeletion ? (["deleteRemoteDirectory", "deleteRemoteFile"] as const) : []),
 							...(confirmRemoteDeletion ? (["deleteLocalDirectory", "deleteLocalFile"] as const) : [])
 						])
-						const deferredPaths = new Set(deltas.filter(delta => gatedDeletionTypes.has(delta.type)).map(delta => delta.path))
+						// Lower-cased: on a case-insensitive volume replacing folder "Notes" with file "notes" yields a
+						// gated delete at "/Notes" (previous tree's spelling) and a create at "/notes" (current tree's) —
+						// they must match. On a case-sensitive volume this can only OVER-defer a case-colliding path,
+						// which merely delays it one prompt; under-deferring runs a doomed task every declined cycle.
+						const deferredPaths = new Set(
+							deltas.filter(delta => gatedDeletionTypes.has(delta.type)).map(delta => delta.path.toLowerCase())
+						)
+						// A path is deferred when it IS a gated deletion (their own paths are in the set — this also
+						// drops the deletions themselves) or lives UNDER one: collapseDeltas leaves only the parent
+						// directory's delete delta, so a create/download at "/a/new.txt" beneath a gated "/a" would
+						// otherwise slip through and resurrect part of the very tree the user is deciding about.
+						const isDeferredPath = (path: string): boolean => {
+							let current = path.toLowerCase()
 
-						// Filtering by path alone drops the deletions themselves too — their own paths are in the set.
-						deltasToProcess = deltas.filter(delta => !deferredPaths.has(delta.path))
+							while (true) {
+								if (deferredPaths.has(current)) {
+									return true
+								}
+
+								const parentEnd = current.lastIndexOf("/")
+
+								if (parentEnd <= 0) {
+									return false
+								}
+
+								current = current.slice(0, parentEnd)
+							}
+						}
+
+						deltasToProcess = deltas.filter(delta => !isDeferredPath(delta.path))
 					}
 					postMessageToMain({
 						type: "cycleProcessingTasksStarted",
@@ -883,10 +909,15 @@ export class Sync {
 						}
 					}
 
-					postMessageToMain({
-						type: "cycleSuccess",
-						syncPair: this.syncPair
-					})
+					// NOT on deferred cycles — same as main's skip path. The renderer clears the pending
+					// confirmDeletion banner on cycleSuccess; emitting it here would dismiss an unresolved
+					// mass-deletion warning (and, for a pair paused mid-prompt, nothing would ever re-create it).
+					if (!deferGatedDeletions) {
+						postMessageToMain({
+							type: "cycleSuccess",
+							syncPair: this.syncPair
+						})
+					}
 				}
 			} finally {
 				postMessageToMain({

@@ -326,6 +326,8 @@ describe("Category G — large-deletion confirmation", () => {
 				writeLocal(world, "e.txt", "e")
 				world.triggerWatcher()
 
+				const successesBeforeDecline = messagesOfType(world.messages, "cycleSuccess").length
+
 				await cycleWithDecision(world, "restart")
 
 				expect(confirmDeletionCount(world)).toBeGreaterThan(0)
@@ -334,6 +336,9 @@ describe("Category G — large-deletion confirmation", () => {
 				expect(snapshotRemote(world)["/b.txt"]).toMatchObject({ type: "file" })
 				// NOT deferred: the unrelated upload rode along instead of waiting for a verdict.
 				expect(snapshotRemote(world)["/e.txt"]).toMatchObject({ type: "file" })
+				// A deferred cycle must NOT report success: the renderer clears the pending confirmation
+				// banner on cycleSuccess, which would dismiss an unresolved mass-deletion warning.
+				expect(messagesOfType(world.messages, "cycleSuccess").length).toBe(successesBeforeDecline)
 
 				// Still pending, not forgotten — the base was never advanced past them.
 				await cycleWithDecision(world, "delete")
@@ -341,6 +346,8 @@ describe("Category G — large-deletion confirmation", () => {
 				expect(snapshotRemote(world)["/a.txt"]).toBeUndefined()
 				expect(snapshotRemote(world)["/b.txt"]).toBeUndefined()
 				expect(snapshotRemote(world)["/e.txt"]).toMatchObject({ type: "file" })
+				// The resolved cycle reports success again.
+				expect(messagesOfType(world.messages, "cycleSuccess").length).toBeGreaterThan(successesBeforeDecline)
 			}
 		)
 	})
@@ -454,6 +461,53 @@ describe("Category G — large-deletion confirmation", () => {
 				expect(snapshotRemote(world)["/a.txt"]).toBeUndefined()
 				expect(snapshotRemote(world)["/b.txt"]).toBeUndefined()
 				expect(snapshotRemote(world)["/c.txt"]).toMatchObject({ type: "file" })
+			}
+		)
+	})
+
+	// G14 — the defer covers DESCENDANTS of a deferred path, not just the path itself. Replacing a synced
+	// FILE with a directory full of children emits deleteRemoteFile /notes (gated) + createRemoteDirectory
+	// /notes (same path, G13's case) + uploadFile /notes/child.txt — and that last one lives at a CHILD
+	// path. Running it would mkdir the remote parent next to the still-undeleted remote file "notes",
+	// producing exactly the half-applied state / per-declined-cycle task error the defer exists to prevent.
+	it("G14: children of a deferred path are parked with it", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 2,
+				initialLocal: { "/local/notes": "i am a file", "/local/b.txt": "b", "/local/keep.txt": "k" }
+			},
+			async world => {
+				await plainCycle(world)
+
+				// File -> directory-with-children, plus a second deletion to arm the threshold-2 gate.
+				rmLocal(world, "notes")
+				writeLocal(world, "notes/child.txt", "child")
+				rmLocal(world, "b.txt")
+				world.triggerWatcher()
+
+				await cycleWithDecision(world, "restart")
+
+				expect(confirmDeletionCount(world)).toBeGreaterThan(0)
+				// Nothing was applied on the deferred paths: the remote "notes" is still the FILE...
+				expect(snapshotRemote(world)["/notes"]).toMatchObject({ type: "file" })
+				// ...the child upload did not run (it would have mkdir'd a remote directory besides it)...
+				expect(snapshotRemote(world)["/notes/child.txt"]).toBeUndefined()
+				expect(world.sync.taskErrors).toHaveLength(0)
+				// ...and the unrelated file is untouched.
+				expect(snapshotRemote(world)["/keep.txt"]).toMatchObject({ type: "file" })
+
+				// Confirming later applies the full type change: file gone, directory + child uploaded.
+				// A fully-deferred cycle leaves both tree caches untouched, so the next cycle would exit at
+				// cycleNoChanges; in production the periodic rescan re-arms it — here the watcher stands in.
+				world.triggerWatcher()
+
+				await cycleWithDecision(world, "delete")
+
+				expect(snapshotRemote(world)["/notes"]).toMatchObject({ type: "directory" })
+				expect(snapshotRemote(world)["/notes/child.txt"]).toMatchObject({ type: "file" })
+				expect(snapshotRemote(world)["/b.txt"]).toBeUndefined()
 			}
 		)
 	})
