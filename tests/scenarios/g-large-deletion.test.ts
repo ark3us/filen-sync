@@ -430,6 +430,44 @@ describe("Category G — large-deletion confirmation", () => {
 		)
 	})
 
+	// G17 — an unanswered prompt must be re-stated on EVERY cycle, and no cycle may report success over it.
+	// The renderer clears its warning bar on cycleSuccess and on nothing else, so a single stray success would
+	// leave the bar reading "everything synced" while a mass deletion sits waiting for a human. Three cycles,
+	// because the second and third take the no-changes early return (both trees are served from cache) — a
+	// different code path from the first, and the one a real idle client spends almost all its time on.
+	it("G17: an unanswered prompt is restated every cycle and no cycle reports success", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 2,
+				initialLocal: { "/local/a.txt": "a", "/local/b.txt": "b", "/local/c.txt": "c" }
+			},
+			async world => {
+				await plainCycle(world)
+
+				rmLocal(world, "a.txt")
+				rmLocal(world, "b.txt")
+				world.triggerWatcher()
+
+				const successesBefore = messagesOfType(world.messages, "cycleSuccess").length
+
+				for (let cycle = 0; cycle < 3; cycle++) {
+					const promptsBefore = confirmDeletionCount(world)
+
+					await plainCycle(world)
+
+					expect(confirmDeletionCount(world)).toBe(promptsBefore + 1)
+					expect(messagesOfType(world.messages, "cycleSuccess").length).toBe(successesBefore)
+				}
+
+				// Still deferred after all three: nothing was deleted behind the unanswered prompt.
+				expect(snapshotRemote(world)["/a.txt"]).toMatchObject({ type: "file" })
+				expect(snapshotRemote(world)["/b.txt"]).toMatchObject({ type: "file" })
+			}
+		)
+	})
+
 	// G10 — the threshold may only LOWER the bar. A threshold larger than the pair itself must not make a
 	// full wipe pass unannounced (it would silently disable the very guarantee the setting refines).
 	it("G10: a threshold above the tree size still prompts on a full wipe", async () => {
