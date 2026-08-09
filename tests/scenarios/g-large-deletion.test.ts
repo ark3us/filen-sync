@@ -345,6 +345,40 @@ describe("Category G — large-deletion confirmation", () => {
 		)
 	})
 
+	// G13 — a deferred deletion parks everything queued for the same PATH, not just the deletion itself.
+	// Replacing a folder with a file of the same name emits both a delete and an upload for that path; the
+	// upload cannot succeed while the folder is still there ("a directory with that name exists"), so
+	// running it alone would raise a task error on every declined cycle.
+	it("G13: a deferred deletion also parks the create queued for the same path", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 2,
+				initialLocal: { "/local/notes/x.txt": "x", "/local/notes/y.txt": "y", "/local/keep.txt": "k" }
+			},
+			async world => {
+				await plainCycle(world)
+
+				rmLocal(world, "notes")
+				writeLocal(world, "notes", "now a file")
+				world.triggerWatcher()
+
+				await cycleWithDecision(world, "restart")
+
+				expect(confirmDeletionCount(world)).toBeGreaterThan(0)
+				// The folder and its contents are untouched...
+				expect(snapshotRemote(world)["/notes"]).toMatchObject({ type: "directory" })
+				expect(snapshotRemote(world)["/notes/x.txt"]).toMatchObject({ type: "file" })
+				// ...the doomed upload was never attempted, so the declined cycle reports no error...
+				expect(world.sync.taskErrors).toHaveLength(0)
+				// ...and nothing extra landed in the cloud. Counted over the raw cloud state, since a file and
+				// a folder sharing one path collapse to a single entry in a path-keyed snapshot.
+				expect(world.cloud.controls.tree().files).toHaveLength(3)
+			}
+		)
+	})
+
 	// G10 — the threshold may only LOWER the bar. A threshold larger than the pair itself must not make a
 	// full wipe pass unannounced (it would silently disable the very guarantee the setting refines).
 	it("G10: a threshold above the tree size still prompts on a full wipe", async () => {
