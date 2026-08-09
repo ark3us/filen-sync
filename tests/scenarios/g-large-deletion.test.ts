@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest"
 import { SYNC_INTERVAL } from "../../src/constants"
 import { createWorld, BASE_TIME, type CreateWorldOptions, type World } from "../harness/world"
 import { snapshotLocal, snapshotRemote, messagesOfType } from "../harness/snapshot"
-import { rmLocal, writeLocal } from "../harness/mutations"
+import { renameLocal, rmLocal, writeLocal } from "../harness/mutations"
 
 /**
  * Category G — large-deletion confirmation (behavioral spec §G, §6). When
@@ -377,6 +377,55 @@ describe("Category G — large-deletion confirmation", () => {
 				// ...and nothing extra landed in the cloud. Counted over the raw cloud state, since a file and
 				// a folder sharing one path collapse to a single entry in a path-keyed snapshot.
 				expect(world.cloud.controls.tree().files).toHaveLength(3)
+			}
+		)
+	})
+
+	// G16 — a rename queued in a deferred cycle waits with the deletions. Rename detection needs the base tree
+	// to still agree with the OTHER side about the source path, and a deferred cycle freezes the base on purpose.
+	// Executing the rename anyway breaks that agreement, so the next cycle can no longer prove the move and reads
+	// the old path as deleted — inflating the count the user is asked to approve (here: 2 would become 6) and
+	// invalidating an approval already given for the smaller set.
+	it("G16: a rename in a deferred cycle does not inflate the next prompt", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 2,
+				initialLocal: {
+					"/local/del1.txt": "1",
+					"/local/del2.txt": "2",
+					"/local/moveme/a.txt": "a",
+					"/local/moveme/b.txt": "b",
+					"/local/moveme/c.txt": "c"
+				}
+			},
+			async world => {
+				await plainCycle(world)
+
+				rmLocal(world, "del1.txt")
+				rmLocal(world, "del2.txt")
+				renameLocal(world, "moveme", "moved")
+				world.triggerWatcher()
+
+				await cycleWithDecision(world, "restart")
+
+				const prompts = messagesOfType(world.messages, "confirmDeletion")
+
+				expect(prompts.length).toBeGreaterThan(1)
+				// Every prompt describes the same two deletions: the moved folder never leaked into the count.
+				expect(prompts.map(prompt => prompt.data.count)).toEqual(prompts.map(() => 2))
+				// The rename waited for the verdict, so the cloud still shows the pre-move layout.
+				expect(snapshotRemote(world)["/moveme/a.txt"]).toMatchObject({ type: "file" })
+
+				// Approving applies both the deletions and the parked rename.
+				await cycleWithDecision(world, "delete")
+				await plainCycle(world)
+
+				expect(snapshotRemote(world)["/del1.txt"]).toBeUndefined()
+				expect(snapshotRemote(world)["/del2.txt"]).toBeUndefined()
+				expect(snapshotRemote(world)["/moved/a.txt"]).toMatchObject({ type: "file" })
+				expect(snapshotRemote(world)["/moveme"]).toBeUndefined()
 			}
 		)
 	})

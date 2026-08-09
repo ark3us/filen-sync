@@ -789,7 +789,22 @@ export class Sync {
 							}
 						}
 
-						deltasToProcess = deltas.filter(delta => !isDeferredPath(delta.path))
+						// Renames wait too, whatever their path. Rename detection is not a property of one side: a move is
+						// only emitted when the OTHER side still agrees with the base about the source path (see
+						// remoteSourceUnchanged/localSourceUnchanged in deltas.ts). Executing a rename while the base is
+						// deliberately frozen destroys that agreement, so next cycle the move can no longer be proven and
+						// decomposes into a deletion of the old path plus a creation of the new one. Nothing is lost (the old
+						// path is gone on both sides, so deleting it is a no-op), but the deletion count the user is asked to
+						// approve inflates -- a 3-file folder moved during a 2-item prompt re-prompts as 6 -- and an approval
+						// already given for the smaller set stops matching its fingerprint.
+						const deferredRenameTypes = new Set<Delta["type"]>([
+							"renameLocalDirectory",
+							"renameLocalFile",
+							"renameRemoteDirectory",
+							"renameRemoteFile"
+						])
+
+						deltasToProcess = deltas.filter(delta => !deferredRenameTypes.has(delta.type) && !isDeferredPath(delta.path))
 					}
 					postMessageToMain({
 						type: "cycleProcessingTasksStarted",
