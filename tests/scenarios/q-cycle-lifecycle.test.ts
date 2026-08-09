@@ -182,7 +182,7 @@ describe("Category Q — cycle lifecycle internals", () => {
 		})
 	})
 
-	it("Q7: the deletion-confirmation prompt is re-emitted every second while it waits for a decision", async () => {
+	it("Q7: an unanswered prompt is re-emitted once per cycle and never blocks the cycle", async () => {
 		await withWorld(
 			{
 				mode: "twoWay",
@@ -196,37 +196,34 @@ describe("Category Q — cycle lifecycle internals", () => {
 				rmLocal(world, "b.txt")
 				world.triggerWatcher()
 
+				// The gate asks and moves on: the cycle completes on its own, with NO decision delivered. It used
+				// to block here until a human answered, holding the account lock (1 Hz resend) for as long as the
+				// prompt went unanswered — indefinitely if nobody ever looked.
 				await vi.advanceTimersByTimeAsync(SYNC_INTERVAL + 1)
+				await world.sync.runCycle()
 
-				let settled = false
-				const cyclePromise = world.sync.runCycle().finally(() => {
-					settled = true
-				})
+				const afterFirstPrompt = messagesOfType(world.messages, "confirmDeletion").length
 
-				// Advance (without delivering a decision) until the prompt opens.
-				for (let tick = 0; tick < 30 && messagesOfType(world.messages, "confirmDeletion").length === 0; tick++) {
-					await vi.advanceTimersByTimeAsync(1000)
-				}
+				expect(afterFirstPrompt).toBeGreaterThan(0)
+				// Deferred, not applied.
+				expect(snapshotRemote(world)["/a.txt"]).toMatchObject({ type: "file" })
 
-				const afterOpen = messagesOfType(world.messages, "confirmDeletion").length
+				// A cycle with nothing new to do still re-posts the outstanding prompt (the renderer clears its
+				// banner on cycleStarted) and does NOT report success over a pending mass deletion.
+				const successesBefore = messagesOfType(world.messages, "cycleSuccess").length
 
-				expect(afterOpen).toBeGreaterThan(0)
+				await vi.advanceTimersByTimeAsync(SYNC_INTERVAL + 1)
+				await world.sync.runCycle()
 
-				// One more second with no decision → the prompt is re-emitted (the waiting branch).
-				await vi.advanceTimersByTimeAsync(1000)
+				expect(messagesOfType(world.messages, "confirmDeletion").length).toBeGreaterThan(afterFirstPrompt)
+				expect(messagesOfType(world.messages, "cycleSuccess").length).toBe(successesBefore)
 
-				expect(messagesOfType(world.messages, "confirmDeletion").length).toBeGreaterThan(afterOpen)
+				// Answering "delete" lets the NEXT cycle apply exactly the set that was prompted.
+				world.worker.confirmDeletion(world.syncPair.uuid, "delete")
 
-				// Now deliver the decision each tick until the cycle completes.
-				for (let tick = 0; tick < 30 && !settled; tick++) {
-					world.worker.confirmDeletion(world.syncPair.uuid, "delete")
+				await vi.advanceTimersByTimeAsync(SYNC_INTERVAL + 1)
+				await world.sync.runCycle()
 
-					await vi.advanceTimersByTimeAsync(1000)
-				}
-
-				await cyclePromise
-
-				// "delete" was confirmed, so the emptying proceeded.
 				expect(snapshotRemote(world)).toEqual({})
 			}
 		)

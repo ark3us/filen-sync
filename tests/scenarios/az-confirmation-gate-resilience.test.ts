@@ -37,22 +37,17 @@ async function plainCycle(world: World): Promise<void> {
 	await world.sync.runCycle()
 }
 
-/** Drive one cycle, delivering `decision` to any confirmation prompt so the cycle can complete. */
+/** Drive the two cycles a confirmation takes: one that prompts, one that applies `decision`. */
 async function cycleWithDecision(world: World, decision: "delete" | "restart"): Promise<void> {
+	// The gate does not block: the first cycle posts the prompt and defers the gated deletions, the
+	// answer is recorded, and the NEXT cycle consumes it (applying the deletions for "delete").
 	await vi.advanceTimersByTimeAsync(SYNC_INTERVAL + 1)
+	await world.sync.runCycle()
 
-	let settled = false
-	const cyclePromise = world.sync.runCycle().finally(() => {
-		settled = true
-	})
+	world.worker.confirmDeletion(world.syncPair.uuid, decision)
 
-	for (let tick = 0; tick < 30 && !settled; tick++) {
-		world.worker.confirmDeletion(world.syncPair.uuid, decision)
-
-		await vi.advanceTimersByTimeAsync(1000)
-	}
-
-	await cyclePromise
+	await vi.advanceTimersByTimeAsync(SYNC_INTERVAL + 1)
+	await world.sync.runCycle()
 }
 
 /** Open the prompt, then "crash": abandon the awaiting cycle (the process dies) without answering. */

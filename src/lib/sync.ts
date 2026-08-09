@@ -3,7 +3,7 @@ import { type SyncPair, type SyncMode } from "../types"
 import { SYNC_INTERVAL, LOCAL_TRASH_NAME } from "../constants"
 import { LocalFileSystem, LocalTree, type LocalTreeError } from "./filesystems/local"
 import { RemoteFileSystem, RemoteTree } from "./filesystems/remote"
-import Deltas from "./deltas"
+import Deltas, { type Delta } from "./deltas"
 import Tasks, { type TaskError } from "./tasks"
 import State from "./state"
 import { postMessageToMain } from "./ipc"
@@ -15,6 +15,18 @@ import pathModule from "path"
 import { type SyncEnvironment } from "./environment"
 import { v4 as uuidv4 } from "uuid"
 import FastGlob from "fast-glob"
+
+/**
+ * Normalize a user-supplied large-deletion threshold (absolute number of deletions at which the
+ * confirmation prompt fires). Only a whole number >= 1 is honored; everything else (0, negative,
+ * fractional, NaN, Infinity, wrong type — it comes from a config file we do not control) falls back to
+ * `undefined`, i.e. the default "the deletions would wipe out the whole previously-known tree" rule.
+ * The fallback is deliberately the SAFE direction: a malformed value must never silently disable the
+ * gate, and a 0/negative one would prompt on every single deleted file until the user gave up on it.
+ */
+export function normalizeLargeDeletionThreshold(value?: number): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined
+}
 
 /**
  * Sync
@@ -61,7 +73,15 @@ export class Sync {
 	public cleanupLocalTrashInterval: ReturnType<typeof setInterval> | undefined = undefined
 	public isPreviousSavedTreeStateEmpty: boolean = true
 	public requireConfirmationOnLargeDeletion: boolean
+	public largeDeletionThreshold: number | undefined
 	public deletionConfirmationResult: "delete" | "restart" | "waiting" = "waiting"
+	/** Set of gated deletions the user was last asked about ("<side>:<count>"), null when nothing is pending. */
+	public promptedDeletionFingerprint: string | null = null
+	/** The set the user approved. Applied only if the next cycle's set still matches it, then cleared. */
+	public approvedDeletionFingerprint: string | null = null
+	/** Re-posted on cycles that end early, so the renderer's pending-deletion banner survives them. */
+	public lastConfirmDeletionMessage: { where: "local" | "remote" | "both"; previous: number; current: number; count: number } | null =
+		null
 
 	/**
 	 * Creates an instance of Sync.
@@ -84,6 +104,7 @@ export class Sync {
 		this.localTrashDisabled = syncPair.localTrashDisabled
 		this.requireConfirmationOnLargeDeletion =
 			typeof syncPair.requireConfirmationOnLargeDeletion === "boolean" ? syncPair.requireConfirmationOnLargeDeletion : false
+		this.largeDeletionThreshold = normalizeLargeDeletionThreshold(syncPair.largeDeletionThreshold)
 		this.localFileSystem = new LocalFileSystem(this)
 		this.remoteFileSystem = new RemoteFileSystem(this)
 		this.deltas = new Deltas(this)
@@ -538,11 +559,26 @@ export class Sync {
 						}
 					})
 
-					if (!currentLocalTree.changed && !currentRemoteTree.changed) {
-						postMessageToMain({
-							type: "cycleSuccess",
-							syncPair: this.syncPair
-						})
+					// An approved deletion must NOT wait for the next tree change: both trees are served from cache
+					// for up to LOCAL_RESCAN_SAFETY_INTERVAL, so bailing out here would leave the user's "yes"
+					// unapplied for up to a minute after the click. The cached trees are exactly the ones the
+					// prompt was computed from, so re-deriving the deltas from them reproduces the approved set.
+					if (!currentLocalTree.changed && !currentRemoteTree.changed && !this.approvedDeletionFingerprint) {
+						// A decision is still outstanding: re-post it so the renderer's banner survives this cycle
+						// (it clears the banner on cycleStarted), and do NOT report success over a pending mass
+						// deletion. This replaces the 1 Hz resend the blocking wait used to do.
+						if (this.promptedDeletionFingerprint && this.lastConfirmDeletionMessage) {
+							postMessageToMain({
+								type: "confirmDeletion",
+								syncPair: this.syncPair,
+								data: this.lastConfirmDeletionMessage
+							})
+						} else {
+							postMessageToMain({
+								type: "cycleSuccess",
+								syncPair: this.syncPair
+							})
+						}
 
 						postMessageToMain({
 							type: "cycleNoChanges",
@@ -608,173 +644,273 @@ export class Sync {
 						syncPair: this.syncPair
 					})
 
+					// Items this cycle would delete on each side. RAW counts (pre-collapse): rename/move detection
+					// already decremented them, but nothing downstream can quietly shrink them below the gate.
+					const remoteDeleteCount = deleteRemoteDirectoryCountRaw + deleteRemoteFileCountRaw
+					const localDeleteCount = deleteLocalDirectoryCountRaw + deleteLocalFileCountRaw
+
+					// The count at which we ask. The base rule is the previous tree's size ("everything we knew
+					// about is being deleted"); a configured threshold is an ABSOLUTE number of deletions that
+					// can only LOWER that bar, never raise it — min(), not ??. A threshold of 500 on a 10-item
+					// pair must not mean "wiping this pair is fine", which is exactly what a plain override
+					// would have meant: the wipe guarantee is the feature the setting refines, not one it may
+					// switch off. The original rule also required the side to be EMPTY now; that is dropped,
+					// since a threshold below the tree size could never satisfy it. Consequence on the default
+					// path: a cycle that deletes the whole known tree AND creates new items now prompts too —
+					// deliberate, and in the safe direction.
+					const threshold = this.largeDeletionThreshold ?? Infinity
+					const localDeletionTrigger = Math.min(threshold, this.previousLocalTree.size)
+					const remoteDeletionTrigger = Math.min(threshold, this.previousRemoteTree.size)
+
+					// Deletions APPLIED REMOTELY, caused by items vanishing LOCALLY — hence `where: "local"` and
+					// the local tree as the reference size. `previousTree.size > 0` keeps a never-yet-scanned
+					// pair (no base) from prompting on its first cycle.
 					const confirmLocalDeletion =
 						this.previousLocalTree.size > 0 &&
-						currentLocalTree.result.size === 0 &&
-						deleteRemoteDirectoryCountRaw + deleteRemoteFileCountRaw > 0 &&
-						this.previousLocalTree.size <= deleteRemoteDirectoryCountRaw + deleteRemoteFileCountRaw &&
+						remoteDeleteCount > 0 &&
+						remoteDeleteCount >= localDeletionTrigger &&
 						(cycleMode === "twoWay" || cycleMode === "localToCloud")
 
 					const confirmRemoteDeletion =
 						this.previousRemoteTree.size > 0 &&
-						currentRemoteTree.result.size === 0 &&
-						deleteLocalDirectoryCountRaw + deleteLocalFileCountRaw > 0 &&
-						this.previousRemoteTree.size <= deleteLocalDirectoryCountRaw + deleteLocalFileCountRaw &&
+						localDeleteCount > 0 &&
+						localDeleteCount >= remoteDeletionTrigger &&
 						(cycleMode === "twoWay" || cycleMode === "cloudToLocal")
 
-					let skipSyncDueToConfirmDeletionRestart = false
+					let deferGatedDeletions = false
 
-					// If the previous tree has nodes and the current one is empty, we should prompt the user to confirm deletion
+					// The gate ASKS, it does not WAIT. The cycle used to block here until a human clicked, holding
+					// the account lock the whole time — every other device on the account stalled for as long as
+					// the prompt went unanswered, and an ignored prompt stalled them forever. Deferring is now
+					// cheap and correct (only the gated deletions are held back), so the cycle posts the prompt,
+					// defers, and finishes; the answer is consumed by a later cycle.
 					if (this.requireConfirmationOnLargeDeletion && (confirmLocalDeletion || confirmRemoteDeletion)) {
-						this.deletionConfirmationResult = "waiting"
+						const where = confirmLocalDeletion && confirmRemoteDeletion ? "both" : confirmLocalDeletion ? "local" : "remote"
+						const count =
+							confirmLocalDeletion && confirmRemoteDeletion
+								? remoteDeleteCount + localDeleteCount
+								: confirmLocalDeletion
+								? remoteDeleteCount
+								: localDeleteCount
+						// An approval is bound to WHAT THE USER WAS SHOWN — the side and the number of items. If the
+						// deletion set grew (or moved to the other side) between the prompt and the click, the
+						// fingerprint no longer matches and the user is asked again rather than having their "yes"
+						// silently applied to a bigger deletion than the one they agreed to.
+						const fingerprint = `${where}:${count}`
 
-						const sendConfirmationMessage = () => {
+						if (this.approvedDeletionFingerprint === fingerprint) {
+							// One approval, one cycle: consumed here so a later, identical-looking deletion has to
+							// be confirmed on its own.
+							this.approvedDeletionFingerprint = null
+							this.promptedDeletionFingerprint = null
+							this.deletionConfirmationResult = "waiting"
+						} else {
+							// Any approval still on file was for a different set — drop it rather than carry it.
+							this.approvedDeletionFingerprint = null
+							this.promptedDeletionFingerprint = fingerprint
+							this.lastConfirmDeletionMessage = {
+								where,
+								previous:
+									confirmLocalDeletion && confirmRemoteDeletion
+										? this.previousLocalTree.size + this.previousRemoteTree.size
+										: confirmLocalDeletion
+										? this.previousLocalTree.size
+										: this.previousRemoteTree.size,
+								current:
+									confirmLocalDeletion && confirmRemoteDeletion
+										? currentLocalTree.result.size + currentRemoteTree.result.size
+										: confirmLocalDeletion
+										? currentLocalTree.result.size
+										: currentRemoteTree.result.size,
+								count
+							}
+
 							postMessageToMain({
 								type: "confirmDeletion",
 								syncPair: this.syncPair,
-								data: {
-									where:
-										confirmLocalDeletion && confirmRemoteDeletion ? "both" : confirmLocalDeletion ? "local" : "remote",
-									previous:
-										confirmLocalDeletion && confirmRemoteDeletion
-											? this.previousLocalTree.size + this.previousRemoteTree.size
-											: confirmLocalDeletion
-											? this.previousLocalTree.size
-											: this.previousRemoteTree.size,
-									current:
-										confirmLocalDeletion && confirmRemoteDeletion
-											? currentLocalTree.result.size + currentRemoteTree.result.size
-											: confirmLocalDeletion
-											? currentLocalTree.result.size
-											: currentRemoteTree.result.size
+								data: this.lastConfirmDeletionMessage
+							})
+
+							deferGatedDeletions = true
+						}
+					} else {
+						// The gate did not arm: whatever was pending is moot (the user restored the files, changed
+						// the mode, or raised the threshold). Clearing it stops cycleSuccess from being suppressed
+						// forever by a prompt nobody can answer any more.
+						this.promptedDeletionFingerprint = null
+						this.approvedDeletionFingerprint = null
+						this.lastConfirmDeletionMessage = null
+					}
+
+					// Declined (or unanswered / paused mid-wait): drop ONLY the deletions the gate is about and run
+					// the rest of the cycle. Skipping every task instead — the old behavior — held uploads and
+					// downloads hostage to a prompt nobody had answered yet, and with a low threshold that stall is
+					// routine rather than a once-in-a-lifetime full wipe. The base tree is deliberately NOT advanced
+					// below, so the deferred deletions are re-detected (and re-prompted) next cycle; nothing is
+					// silently forgotten, and the remote copies are never resurrected as "new" items.
+					// Everything else queued for a PATH whose deletion is deferred waits with it. Changing an item's type
+					// (a folder "notes" replaced by a file "notes") emits a delete AND a create for that one path, and the
+					// create cannot succeed while the old item is still there — both sides refuse it, the cloud with
+					// "a directory with that name exists" and the local FS with EISDIR. Letting it run would just fail a
+					// doomed task and raise a task error on every declined cycle, on top of a prompt already waiting.
+					let deltasToProcess = deltas
+
+					if (deferGatedDeletions) {
+						const gatedDeletionTypes = new Set<Delta["type"]>([
+							...(confirmLocalDeletion ? (["deleteRemoteDirectory", "deleteRemoteFile"] as const) : []),
+							...(confirmRemoteDeletion ? (["deleteLocalDirectory", "deleteLocalFile"] as const) : [])
+						])
+						// Lower-cased: on a case-insensitive volume replacing folder "Notes" with file "notes" yields a
+						// gated delete at "/Notes" (previous tree's spelling) and a create at "/notes" (current tree's) —
+						// they must match. On a case-sensitive volume this can only OVER-defer a case-colliding path,
+						// which merely delays it one prompt; under-deferring runs a doomed task every declined cycle.
+						const deferredPaths = new Set(
+							deltas.filter(delta => gatedDeletionTypes.has(delta.type)).map(delta => delta.path.toLowerCase())
+						)
+						// A path is deferred when it IS a gated deletion (their own paths are in the set — this also
+						// drops the deletions themselves) or lives UNDER one: collapseDeltas leaves only the parent
+						// directory's delete delta, so a create/download at "/a/new.txt" beneath a gated "/a" would
+						// otherwise slip through and resurrect part of the very tree the user is deciding about.
+						const isDeferredPath = (path: string): boolean => {
+							let current = path.toLowerCase()
+
+							while (true) {
+								if (deferredPaths.has(current)) {
+									return true
 								}
+
+								const parentEnd = current.lastIndexOf("/")
+
+								if (parentEnd <= 0) {
+									return false
+								}
+
+								current = current.slice(0, parentEnd)
+							}
+						}
+
+						// Renames wait too, whatever their path. Rename detection is not a property of one side: a move is
+						// only emitted when the OTHER side still agrees with the base about the source path (see
+						// remoteSourceUnchanged/localSourceUnchanged in deltas.ts). Executing a rename while the base is
+						// deliberately frozen destroys that agreement, so next cycle the move can no longer be proven and
+						// decomposes into a deletion of the old path plus a creation of the new one. Nothing is lost (the old
+						// path is gone on both sides, so deleting it is a no-op), but the deletion count the user is asked to
+						// approve inflates -- a 3-file folder moved during a 2-item prompt re-prompts as 6 -- and an approval
+						// already given for the smaller set stops matching its fingerprint.
+						const deferredRenameTypes = new Set<Delta["type"]>([
+							"renameLocalDirectory",
+							"renameLocalFile",
+							"renameRemoteDirectory",
+							"renameRemoteFile"
+						])
+
+						deltasToProcess = deltas.filter(delta => !deferredRenameTypes.has(delta.type) && !isDeferredPath(delta.path))
+					}
+					postMessageToMain({
+						type: "cycleProcessingTasksStarted",
+						syncPair: this.syncPair
+					})
+
+					const { doneTasks, errors } = await this.tasks.process({ deltasSorted: deltasToProcess })
+
+					postMessageToMain({
+						type: "cycleProcessingTasksDone",
+						syncPair: this.syncPair
+					})
+
+					postMessageToMain({
+						type: "taskErrors",
+						syncPair: this.syncPair,
+						data: {
+							errors: errors.map(e => ({
+								...e,
+								error: serializeError(e.error)
+							}))
+						}
+					})
+
+					this.taskErrors = errors
+
+					// Advance the base + persist state ONLY when the cycle finished cleanly and was NOT paused/
+					// removed mid-processing. When paused, processTask SKIPPED the remaining tasks so this cycle
+					// could return and release the account lock; advancing the base here would fold the skipped
+					// work into it as already-synced (a pending upload would never fire again). Leaving the base
+					// untouched makes the next cycle after resume re-fetch fresh trees and redo exactly the
+					// outstanding work — the completed tasks are reflected in those fresh trees, so nothing is
+					// re-done wrongly and nothing is lost (skip-and-restart, like the deletion-confirmation gate).
+					if (this.taskErrors.length === 0 && !this.paused && !this.removed) {
+						if (doneTasks.length > 0) {
+							postMessageToMain({
+								type: "cycleApplyingStateStarted",
+								syncPair: this.syncPair
+							})
+
+							const didLocalChanges = doneTasks.some(
+								task =>
+									task.type === "createLocalDirectory" ||
+									task.type === "deleteLocalDirectory" ||
+									task.type === "deleteLocalFile" ||
+									task.type === "renameLocalDirectory" ||
+									task.type === "renameLocalFile"
+							)
+							const didRemoteChanges = doneTasks.some(
+								task =>
+									task.type === "renameRemoteDirectory" ||
+									task.type === "renameRemoteFile" ||
+									task.type === "createRemoteDirectory" ||
+									task.type === "deleteRemoteDirectory" ||
+									task.type === "deleteRemoteFile"
+							)
+
+							// Here we reset the internal local/remote tree changed times so we rescan after we did changes for consistency
+							if (didLocalChanges) {
+								this.localFileSystem.lastDirectoryChangeTimestamp = Date.now() - SYNC_INTERVAL * 2
+								this.localFileSystem.getDirectoryTreeCache = {
+									timestamp: 0,
+									tree: {},
+									inodes: {},
+									ignored: [],
+									errors: [],
+									size: 0,
+									scanIncomplete: 0
+								}
+							}
+
+							if (didRemoteChanges) {
+								this.remoteFileSystem.getDirectoryTreeCache = {
+									timestamp: 0,
+									tree: {},
+									uuids: {},
+									ignored: [],
+									size: 0
+								}
+							}
+
+							/* 
+
+							Removed due to redundancy. We do not need to apply the state again since we hold a reference to the FS (remote/local) "getDirectoryTreeCache" objects.
+							
+							const applied = this.state.applyDoneTasksToState({
+								doneTasks,
+								currentLocalTree: currentLocalTree.result,
+								currentRemoteTree: currentRemoteTree.result
+							})
+
+							currentLocalTree.result = applied.currentLocalTree
+							currentRemoteTree.result = applied.currentRemoteTree
+							*/
+
+							postMessageToMain({
+								type: "cycleApplyingStateDone",
+								syncPair: this.syncPair
 							})
 						}
 
-						sendConfirmationMessage()
-
-						await new Promise<void>(resolve => {
-							const interval = setInterval(() => {
-								// Also bail when the pair is paused or removed while we wait — otherwise the cycle
-								// spins here indefinitely (the user may never answer) while HOLDING the lock, which
-								// starves every other device on the account. A bail-out leaves the decision as
-								// "waiting", so the skip-and-restart path below releases the lock and exits cleanly.
-								if (this.deletionConfirmationResult !== "waiting" || this.paused || this.removed) {
-									clearInterval(interval)
-
-									resolve()
-								} else {
-									sendConfirmationMessage()
-								}
-							}, 1000)
-						})
-
-						if (this.deletionConfirmationResult === "waiting" || this.deletionConfirmationResult === "restart") {
-							skipSyncDueToConfirmDeletionRestart = true
-						}
-					}
-
-					if (!skipSyncDueToConfirmDeletionRestart) {
-						postMessageToMain({
-							type: "cycleProcessingTasksStarted",
-							syncPair: this.syncPair
-						})
-
-						const { doneTasks, errors } = await this.tasks.process({ deltasSorted: deltas })
-
-						postMessageToMain({
-							type: "cycleProcessingTasksDone",
-							syncPair: this.syncPair
-						})
-
-						postMessageToMain({
-							type: "taskErrors",
-							syncPair: this.syncPair,
-							data: {
-								errors: errors.map(e => ({
-									...e,
-									error: serializeError(e.error)
-								}))
-							}
-						})
-
-						this.taskErrors = errors
-
-						// Advance the base + persist state ONLY when the cycle finished cleanly and was NOT paused/
-						// removed mid-processing. When paused, processTask SKIPPED the remaining tasks so this cycle
-						// could return and release the account lock; advancing the base here would fold the skipped
-						// work into it as already-synced (a pending upload would never fire again). Leaving the base
-						// untouched makes the next cycle after resume re-fetch fresh trees and redo exactly the
-						// outstanding work — the completed tasks are reflected in those fresh trees, so nothing is
-						// re-done wrongly and nothing is lost (skip-and-restart, like the deletion-confirmation gate).
-						if (this.taskErrors.length === 0 && !this.paused && !this.removed) {
-							if (doneTasks.length > 0) {
-								postMessageToMain({
-									type: "cycleApplyingStateStarted",
-									syncPair: this.syncPair
-								})
-
-								const didLocalChanges = doneTasks.some(
-									task =>
-										task.type === "createLocalDirectory" ||
-										task.type === "deleteLocalDirectory" ||
-										task.type === "deleteLocalFile" ||
-										task.type === "renameLocalDirectory" ||
-										task.type === "renameLocalFile"
-								)
-								const didRemoteChanges = doneTasks.some(
-									task =>
-										task.type === "renameRemoteDirectory" ||
-										task.type === "renameRemoteFile" ||
-										task.type === "createRemoteDirectory" ||
-										task.type === "deleteRemoteDirectory" ||
-										task.type === "deleteRemoteFile"
-								)
-
-								// Here we reset the internal local/remote tree changed times so we rescan after we did changes for consistency
-								if (didLocalChanges) {
-									this.localFileSystem.lastDirectoryChangeTimestamp = Date.now() - SYNC_INTERVAL * 2
-									this.localFileSystem.getDirectoryTreeCache = {
-										timestamp: 0,
-										tree: {},
-										inodes: {},
-										ignored: [],
-										errors: [],
-										size: 0,
-										scanIncomplete: 0
-									}
-								}
-
-								if (didRemoteChanges) {
-									this.remoteFileSystem.getDirectoryTreeCache = {
-										timestamp: 0,
-										tree: {},
-										uuids: {},
-										ignored: [],
-										size: 0
-									}
-								}
-
-								/* 
-
-								Removed due to redundancy. We do not need to apply the state again since we hold a reference to the FS (remote/local) "getDirectoryTreeCache" objects.
-								
-								const applied = this.state.applyDoneTasksToState({
-									doneTasks,
-									currentLocalTree: currentLocalTree.result,
-									currentRemoteTree: currentRemoteTree.result
-								})
-
-								currentLocalTree.result = applied.currentLocalTree
-								currentRemoteTree.result = applied.currentRemoteTree
-								*/
-
-								postMessageToMain({
-									type: "cycleApplyingStateDone",
-									syncPair: this.syncPair
-								})
-							}
-
+						// The deletions the user declined were filtered out of this cycle, so the base must keep
+						// describing the world BEFORE them. Advancing it would drop them from the delta set for good —
+						// the remote copies would then read as new items and get downloaded back, silently undoing a
+						// deletion the user never resolved. The cache invalidation above still runs: tasks DID happen.
+						if (!deferGatedDeletions) {
 							postMessageToMain({
 								type: "cycleSavingStateStarted",
 								syncPair: this.syncPair
@@ -815,7 +951,12 @@ export class Sync {
 								syncPair: this.syncPair
 							})
 						}
+					}
 
+					// NOT on deferred cycles — same as main's skip path. The renderer clears the pending
+					// confirmDeletion banner on cycleSuccess; emitting it here would dismiss an unresolved
+					// mass-deletion warning (and, for a pair paused mid-prompt, nothing would ever re-create it).
+					if (!deferGatedDeletions) {
 						postMessageToMain({
 							type: "cycleSuccess",
 							syncPair: this.syncPair

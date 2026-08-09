@@ -16,6 +16,12 @@ export type SyncPair = {
 	paused: boolean
 	localTrashDisabled: boolean
 	requireConfirmationOnLargeDeletion?: boolean
+	/**
+	 * Number of pending deletions on a side at which the confirmation prompt fires (absolute count, >= 1).
+	 * Unset (or invalid) means the default rule: only when the deletions would wipe out the entire
+	 * previously-known tree. Ignored unless `requireConfirmationOnLargeDeletion` is enabled.
+	 */
+	largeDeletionThreshold?: number
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -304,6 +310,11 @@ export type SyncMessage =
 						where: "local" | "remote" | "both"
 						previous: number
 						current: number
+						/**
+						 * How many items the cycle would delete. With a configured threshold the side is not
+						 * necessarily emptied, so `previous`/`current` alone no longer describe the damage.
+						 */
+						count: number
 					}
 			  }
 			| {

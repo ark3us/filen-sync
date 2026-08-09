@@ -1,5 +1,5 @@
 import { type SyncPair, type SyncMessage, type SyncMode } from "./types"
-import Sync from "./lib/sync"
+import Sync, { normalizeLargeDeletionThreshold } from "./lib/sync"
 import FilenSDK, { type FilenSDKConfig } from "@filen/sdk"
 import { Semaphore } from "./semaphore"
 import { SYNC_INTERVAL } from "./constants"
@@ -285,6 +285,20 @@ export class SyncWorker {
 		}
 	}
 
+	/**
+	 * Set the absolute number of deletions at which the confirmation prompt fires. Pass undefined (or an
+	 * invalid value) to restore the default "the whole previously-known tree would be deleted" rule.
+	 */
+	public updateLargeDeletionThreshold(uuid: string, largeDeletionThreshold?: number): void {
+		for (const syncUUID in this.syncs) {
+			if (syncUUID === uuid) {
+				this.syncs[syncUUID]!.largeDeletionThreshold = normalizeLargeDeletionThreshold(largeDeletionThreshold)
+
+				break
+			}
+		}
+	}
+
 	public async fetchIgnorerContent(uuid: string): Promise<string> {
 		for (const syncUUID in this.syncs) {
 			if (syncUUID === uuid) {
@@ -343,10 +357,20 @@ export class SyncWorker {
 		}
 	}
 
+	/**
+	 * Answer the pending large-deletion prompt. The answer is not awaited by a blocked cycle any more: it is
+	 * recorded here and consumed by the next cycle, which applies the deletions only if the set it computes
+	 * still matches the one the user was shown.
+	 */
 	public confirmDeletion(uuid: string, result: "delete" | "restart"): void {
 		for (const syncUUID in this.syncs) {
 			if (syncUUID === uuid) {
-				this.syncs[syncUUID]!.deletionConfirmationResult = result
+				const sync = this.syncs[syncUUID]!
+
+				sync.deletionConfirmationResult = result
+				// "delete" approves exactly the set the last prompt described; "restart" withdraws any approval
+				// (the deletions stay deferred and the prompt returns).
+				sync.approvedDeletionFingerprint = result === "delete" ? sync.promptedDeletionFingerprint : null
 
 				break
 			}
