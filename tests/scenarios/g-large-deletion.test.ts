@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest"
 import { SYNC_INTERVAL } from "../../src/constants"
 import { createWorld, BASE_TIME, type CreateWorldOptions, type World } from "../harness/world"
 import { snapshotLocal, snapshotRemote, messagesOfType } from "../harness/snapshot"
-import { rmLocal } from "../harness/mutations"
+import { rmLocal, writeLocal } from "../harness/mutations"
 
 /**
  * Category G — large-deletion confirmation (behavioral spec §G, §6). When
@@ -303,6 +303,44 @@ describe("Category G — large-deletion confirmation", () => {
 				// "restart" — nothing was deleted remotely, not even the sub-threshold rest of the cycle.
 				expect(snapshotRemote(world)["/a.txt"]).toMatchObject({ type: "file" })
 				expect(snapshotRemote(world)["/b.txt"]).toMatchObject({ type: "file" })
+			}
+		)
+	})
+
+	// G12 — declining the prompt defers ONLY the gated deletions. The rest of the cycle (here an upload
+	// queued in the same cycle) must still run, and the deferred deletions must survive as pending work:
+	// the base tree is not advanced, so confirming them later still applies them.
+	it("G12: restart defers the deletions but lets the rest of the cycle through", async () => {
+		await withWorld(
+			{
+				mode: "twoWay",
+				requireConfirmationOnLargeDeletion: true,
+				largeDeletionThreshold: 2,
+				initialLocal: { "/local/a.txt": "a", "/local/b.txt": "b", "/local/c.txt": "c", "/local/d.txt": "d" }
+			},
+			async world => {
+				await plainCycle(world)
+
+				rmLocal(world, "a.txt")
+				rmLocal(world, "b.txt")
+				writeLocal(world, "e.txt", "e")
+				world.triggerWatcher()
+
+				await cycleWithDecision(world, "restart")
+
+				expect(confirmDeletionCount(world)).toBeGreaterThan(0)
+				// Deferred: both files still in the cloud.
+				expect(snapshotRemote(world)["/a.txt"]).toMatchObject({ type: "file" })
+				expect(snapshotRemote(world)["/b.txt"]).toMatchObject({ type: "file" })
+				// NOT deferred: the unrelated upload rode along instead of waiting for a verdict.
+				expect(snapshotRemote(world)["/e.txt"]).toMatchObject({ type: "file" })
+
+				// Still pending, not forgotten — the base was never advanced past them.
+				await cycleWithDecision(world, "delete")
+
+				expect(snapshotRemote(world)["/a.txt"]).toBeUndefined()
+				expect(snapshotRemote(world)["/b.txt"]).toBeUndefined()
+				expect(snapshotRemote(world)["/e.txt"]).toMatchObject({ type: "file" })
 			}
 		)
 	})

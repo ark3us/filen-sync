@@ -3,7 +3,7 @@ import { type SyncPair, type SyncMode } from "../types"
 import { SYNC_INTERVAL, LOCAL_TRASH_NAME } from "../constants"
 import { LocalFileSystem, LocalTree, type LocalTreeError } from "./filesystems/local"
 import { RemoteFileSystem, RemoteTree } from "./filesystems/remote"
-import Deltas from "./deltas"
+import Deltas, { type Delta } from "./deltas"
 import Tasks, { type TaskError } from "./tasks"
 import State from "./state"
 import { postMessageToMain } from "./ipc"
@@ -655,7 +655,7 @@ export class Sync {
 						localDeleteCount >= remoteDeletionTrigger &&
 						(cycleMode === "twoWay" || cycleMode === "cloudToLocal")
 
-					let skipSyncDueToConfirmDeletionRestart = false
+					let deferGatedDeletions = false
 
 					// If the previous tree has nodes and the current one is empty, we should prompt the user to confirm deletion
 					if (this.requireConfirmationOnLargeDeletion && (confirmLocalDeletion || confirmRemoteDeletion)) {
@@ -709,157 +709,173 @@ export class Sync {
 						})
 
 						if (this.deletionConfirmationResult === "waiting" || this.deletionConfirmationResult === "restart") {
-							skipSyncDueToConfirmDeletionRestart = true
+							deferGatedDeletions = true
 						}
 					}
 
-					if (!skipSyncDueToConfirmDeletionRestart) {
-						postMessageToMain({
-							type: "cycleProcessingTasksStarted",
-							syncPair: this.syncPair
-						})
+					// Declined (or unanswered / paused mid-wait): drop ONLY the deletions the gate is about and run
+					// the rest of the cycle. Skipping every task instead — the old behavior — held uploads and
+					// downloads hostage to a prompt nobody had answered yet, and with a low threshold that stall is
+					// routine rather than a once-in-a-lifetime full wipe. The base tree is deliberately NOT advanced
+					// below, so the deferred deletions are re-detected (and re-prompted) next cycle; nothing is
+					// silently forgotten, and the remote copies are never resurrected as "new" items.
+					// A dropped delete can strand a task that needed it — replacing a file with a directory of the
+					// same name — which fails that one task, blocks the base advance (already blocked here) and is
+					// retried next cycle. No data loss, and it cannot happen at all in the common case.
+					const gatedDeletionTypes = new Set<Delta["type"]>([
+						...(confirmLocalDeletion ? (["deleteRemoteDirectory", "deleteRemoteFile"] as const) : []),
+						...(confirmRemoteDeletion ? (["deleteLocalDirectory", "deleteLocalFile"] as const) : [])
+					])
+					const deltasToProcess = deferGatedDeletions ? deltas.filter(delta => !gatedDeletionTypes.has(delta.type)) : deltas
+					postMessageToMain({
+						type: "cycleProcessingTasksStarted",
+						syncPair: this.syncPair
+					})
 
-						const { doneTasks, errors } = await this.tasks.process({ deltasSorted: deltas })
+					const { doneTasks, errors } = await this.tasks.process({ deltasSorted: deltasToProcess })
 
-						postMessageToMain({
-							type: "cycleProcessingTasksDone",
-							syncPair: this.syncPair
-						})
+					postMessageToMain({
+						type: "cycleProcessingTasksDone",
+						syncPair: this.syncPair
+					})
 
-						postMessageToMain({
-							type: "taskErrors",
-							syncPair: this.syncPair,
-							data: {
-								errors: errors.map(e => ({
-									...e,
-									error: serializeError(e.error)
-								}))
-							}
-						})
+					postMessageToMain({
+						type: "taskErrors",
+						syncPair: this.syncPair,
+						data: {
+							errors: errors.map(e => ({
+								...e,
+								error: serializeError(e.error)
+							}))
+						}
+					})
 
-						this.taskErrors = errors
+					this.taskErrors = errors
 
-						// Advance the base + persist state ONLY when the cycle finished cleanly and was NOT paused/
-						// removed mid-processing. When paused, processTask SKIPPED the remaining tasks so this cycle
-						// could return and release the account lock; advancing the base here would fold the skipped
-						// work into it as already-synced (a pending upload would never fire again). Leaving the base
-						// untouched makes the next cycle after resume re-fetch fresh trees and redo exactly the
-						// outstanding work — the completed tasks are reflected in those fresh trees, so nothing is
-						// re-done wrongly and nothing is lost (skip-and-restart, like the deletion-confirmation gate).
-						if (this.taskErrors.length === 0 && !this.paused && !this.removed) {
-							if (doneTasks.length > 0) {
-								postMessageToMain({
-									type: "cycleApplyingStateStarted",
-									syncPair: this.syncPair
-								})
-
-								const didLocalChanges = doneTasks.some(
-									task =>
-										task.type === "createLocalDirectory" ||
-										task.type === "deleteLocalDirectory" ||
-										task.type === "deleteLocalFile" ||
-										task.type === "renameLocalDirectory" ||
-										task.type === "renameLocalFile"
-								)
-								const didRemoteChanges = doneTasks.some(
-									task =>
-										task.type === "renameRemoteDirectory" ||
-										task.type === "renameRemoteFile" ||
-										task.type === "createRemoteDirectory" ||
-										task.type === "deleteRemoteDirectory" ||
-										task.type === "deleteRemoteFile"
-								)
-
-								// Here we reset the internal local/remote tree changed times so we rescan after we did changes for consistency
-								if (didLocalChanges) {
-									this.localFileSystem.lastDirectoryChangeTimestamp = Date.now() - SYNC_INTERVAL * 2
-									this.localFileSystem.getDirectoryTreeCache = {
-										timestamp: 0,
-										tree: {},
-										inodes: {},
-										ignored: [],
-										errors: [],
-										size: 0,
-										scanIncomplete: 0
-									}
-								}
-
-								if (didRemoteChanges) {
-									this.remoteFileSystem.getDirectoryTreeCache = {
-										timestamp: 0,
-										tree: {},
-										uuids: {},
-										ignored: [],
-										size: 0
-									}
-								}
-
-								/* 
-
-								Removed due to redundancy. We do not need to apply the state again since we hold a reference to the FS (remote/local) "getDirectoryTreeCache" objects.
-								
-								const applied = this.state.applyDoneTasksToState({
-									doneTasks,
-									currentLocalTree: currentLocalTree.result,
-									currentRemoteTree: currentRemoteTree.result
-								})
-
-								currentLocalTree.result = applied.currentLocalTree
-								currentRemoteTree.result = applied.currentRemoteTree
-								*/
-
-								postMessageToMain({
-									type: "cycleApplyingStateDone",
-									syncPair: this.syncPair
-								})
-							}
-
+					// Advance the base + persist state ONLY when the cycle finished cleanly and was NOT paused/
+					// removed mid-processing. When paused, processTask SKIPPED the remaining tasks so this cycle
+					// could return and release the account lock; advancing the base here would fold the skipped
+					// work into it as already-synced (a pending upload would never fire again). Leaving the base
+					// untouched makes the next cycle after resume re-fetch fresh trees and redo exactly the
+					// outstanding work — the completed tasks are reflected in those fresh trees, so nothing is
+					// re-done wrongly and nothing is lost (skip-and-restart, like the deletion-confirmation gate).
+					// `deferGatedDeletions` blocks it for the same reason: the deletions the user declined were
+					// filtered out of this cycle, so the base must keep describing the world BEFORE them. Advancing
+					// it would drop them from the delta set for good — the remote copies would then read as new
+					// items and get downloaded back, silently undoing a deletion the user never resolved.
+					if (this.taskErrors.length === 0 && !this.paused && !this.removed && !deferGatedDeletions) {
+						if (doneTasks.length > 0) {
 							postMessageToMain({
-								type: "cycleSavingStateStarted",
+								type: "cycleApplyingStateStarted",
 								syncPair: this.syncPair
 							})
 
-							// Snapshot the trees as the next cycle's base. We need NEW tree/inode/uuid MAPS so the
-							// directory-tree cache's in-place incremental updates (the watcher add/remove/rename path)
-							// can never bleed into the base — but the item objects can be SHARED by reference: an item
-							// is always created fresh and replaced in the map, never mutated field-by-field, so the
-							// base's items are immutable once snapshotted. A full structuredClone instead deep-copied
-							// every item on every change-cycle — O(tree) CPU plus a second full copy of the tree in
-							// memory — for isolation a shallow map copy already provides. (P3)
-							// Derive `size` from the snapshotted tree, NOT from result.size. A cycle's transfer handlers
-							// add/remove entries in the live tree cache's `.tree` in place but never touch its `.size`,
-							// so result.size is a STALE primitive that disagrees with the tree after any upload/download/
-							// delete. A stale 0 would defeat the large-deletion confirmation gate's `previousTree.size > 0`
-							// guard in the universal first-sync case (an engine-seeded base). This matches exactly how
-							// state.ts recomputes the size on RELOAD (Object.keys(tree).length), so the in-process base and
-							// a restarted one agree. O(N) over an already-O(N) shallow map copy — negligible, once per cycle.
-							const localTreeSnapshot = { ...currentLocalTree.result.tree }
-							const remoteTreeSnapshot = { ...currentRemoteTree.result.tree }
+							const didLocalChanges = doneTasks.some(
+								task =>
+									task.type === "createLocalDirectory" ||
+									task.type === "deleteLocalDirectory" ||
+									task.type === "deleteLocalFile" ||
+									task.type === "renameLocalDirectory" ||
+									task.type === "renameLocalFile"
+							)
+							const didRemoteChanges = doneTasks.some(
+								task =>
+									task.type === "renameRemoteDirectory" ||
+									task.type === "renameRemoteFile" ||
+									task.type === "createRemoteDirectory" ||
+									task.type === "deleteRemoteDirectory" ||
+									task.type === "deleteRemoteFile"
+							)
 
-							this.previousLocalTree = {
-								tree: localTreeSnapshot,
-								inodes: { ...currentLocalTree.result.inodes },
-								size: Object.keys(localTreeSnapshot).length
-							}
-							this.previousRemoteTree = {
-								tree: remoteTreeSnapshot,
-								uuids: { ...currentRemoteTree.result.uuids },
-								size: Object.keys(remoteTreeSnapshot).length
+							// Here we reset the internal local/remote tree changed times so we rescan after we did changes for consistency
+							if (didLocalChanges) {
+								this.localFileSystem.lastDirectoryChangeTimestamp = Date.now() - SYNC_INTERVAL * 2
+								this.localFileSystem.getDirectoryTreeCache = {
+									timestamp: 0,
+									tree: {},
+									inodes: {},
+									ignored: [],
+									errors: [],
+									size: 0,
+									scanIncomplete: 0
+								}
 							}
 
-							await this.state.save()
+							if (didRemoteChanges) {
+								this.remoteFileSystem.getDirectoryTreeCache = {
+									timestamp: 0,
+									tree: {},
+									uuids: {},
+									ignored: [],
+									size: 0
+								}
+							}
+
+							/* 
+
+							Removed due to redundancy. We do not need to apply the state again since we hold a reference to the FS (remote/local) "getDirectoryTreeCache" objects.
+							
+							const applied = this.state.applyDoneTasksToState({
+								doneTasks,
+								currentLocalTree: currentLocalTree.result,
+								currentRemoteTree: currentRemoteTree.result
+							})
+
+							currentLocalTree.result = applied.currentLocalTree
+							currentRemoteTree.result = applied.currentRemoteTree
+							*/
 
 							postMessageToMain({
-								type: "cycleSavingStateDone",
+								type: "cycleApplyingStateDone",
 								syncPair: this.syncPair
 							})
 						}
 
 						postMessageToMain({
-							type: "cycleSuccess",
+							type: "cycleSavingStateStarted",
+							syncPair: this.syncPair
+						})
+
+						// Snapshot the trees as the next cycle's base. We need NEW tree/inode/uuid MAPS so the
+						// directory-tree cache's in-place incremental updates (the watcher add/remove/rename path)
+						// can never bleed into the base — but the item objects can be SHARED by reference: an item
+						// is always created fresh and replaced in the map, never mutated field-by-field, so the
+						// base's items are immutable once snapshotted. A full structuredClone instead deep-copied
+						// every item on every change-cycle — O(tree) CPU plus a second full copy of the tree in
+						// memory — for isolation a shallow map copy already provides. (P3)
+						// Derive `size` from the snapshotted tree, NOT from result.size. A cycle's transfer handlers
+						// add/remove entries in the live tree cache's `.tree` in place but never touch its `.size`,
+						// so result.size is a STALE primitive that disagrees with the tree after any upload/download/
+						// delete. A stale 0 would defeat the large-deletion confirmation gate's `previousTree.size > 0`
+						// guard in the universal first-sync case (an engine-seeded base). This matches exactly how
+						// state.ts recomputes the size on RELOAD (Object.keys(tree).length), so the in-process base and
+						// a restarted one agree. O(N) over an already-O(N) shallow map copy — negligible, once per cycle.
+						const localTreeSnapshot = { ...currentLocalTree.result.tree }
+						const remoteTreeSnapshot = { ...currentRemoteTree.result.tree }
+
+						this.previousLocalTree = {
+							tree: localTreeSnapshot,
+							inodes: { ...currentLocalTree.result.inodes },
+							size: Object.keys(localTreeSnapshot).length
+						}
+						this.previousRemoteTree = {
+							tree: remoteTreeSnapshot,
+							uuids: { ...currentRemoteTree.result.uuids },
+							size: Object.keys(remoteTreeSnapshot).length
+						}
+
+						await this.state.save()
+
+						postMessageToMain({
+							type: "cycleSavingStateDone",
 							syncPair: this.syncPair
 						})
 					}
+
+					postMessageToMain({
+						type: "cycleSuccess",
+						syncPair: this.syncPair
+					})
 				}
 			} finally {
 				postMessageToMain({
