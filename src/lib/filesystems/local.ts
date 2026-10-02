@@ -1,6 +1,7 @@
 import { type Stats } from "fs-extra"
 import {
 	isRelativePathIgnoredByDefault,
+	isNameIgnoredByDefault,
 	serializeError,
 	replacePathStartWithFromAndTo,
 	pathIncludesDotFile,
@@ -167,6 +168,8 @@ export class LocalFileSystem {
 	}
 	public watcherRunning = false
 	private watcherInstance: SyncWatcher | null = null
+	// The ignore rules the running watcher was armed with (see watcherRulesKey).
+	private watcherInstanceRulesKey: string | null = null
 	public readonly itemsMutex = new Semaphore(1)
 	public readonly mutex = new Semaphore(1)
 	public readonly mkdirMutex = new Semaphore(1)
@@ -286,6 +289,50 @@ export class LocalFileSystem {
 		return {
 			ignored: false
 		}
+	}
+
+	/**
+	 * Whether the directory watcher may skip `relativePath` — no watch for it and, for a directory, none for
+	 * anything below it. Must only ever skip what the scan ignores for the WHOLE subtree, or a change would go
+	 * unseen until the safety rescan:
+	 *  - default-ignored names (the local trash included) and excluded dotfiles are checked on every path
+	 *    segment, so a skipped directory's descendants are ignored too;
+	 *  - a `.filenignore`'d directory's descendants are ignored by the gitignore parent rule. The callback is not
+	 *    told the entry type, so a `.filenignore` match counts only when BOTH the file and the directory form are
+	 *    ignored: a dir-only `tmp/` then keeps one watch on the `tmp` entry itself (a FILE named tmp still syncs)
+	 *    and skips every child.
+	 * The length/validity reasons of isPathIgnored are left out: they do not carry over to descendants.
+	 *
+	 * @public
+	 * @param {string} relativePath Relative to the sync root, platform separators.
+	 * @returns {boolean}
+	 */
+	public isPathIgnoredByWatcher(relativePath: string): boolean {
+		const path = pathModule.sep === "/" ? relativePath : relativePath.split(pathModule.sep).join("/")
+
+		if (path.length === 0) {
+			return false
+		}
+
+		// Names only, not isRelativePathIgnoredByDefault: its relative globs all sit under default-ignored names
+		// (so the name check already covers them), and re-running micromatch per entry made it ~10x slower.
+		if (path.split("/").some(part => part.length > 0 && isNameIgnoredByDefault(part))) {
+			return true
+		}
+
+		if (this.sync.excludeDotFiles && pathIncludesDotFile(path) && !isSyncedIgnoreFile(path)) {
+			return true
+		}
+
+		return this.sync.ignorer.ignores(path) && this.sync.ignorer.ignores(path + "/")
+	}
+
+	/**
+	 * Everything isPathIgnoredByWatcher depends on. A running watcher only consults its predicate for entries it
+	 * has not seen yet, so a change here means rebuilding it (see startDirectoryWatcher).
+	 */
+	private watcherRulesKey(): string {
+		return `${this.sync.excludeDotFiles}\n${this.sync.ignorer.appliedContent ?? ""}`
 	}
 
 	public async getDirectoryTree(): Promise<{
@@ -595,13 +642,31 @@ export class LocalFileSystem {
 		await this.watcherMutex.acquire()
 
 		try {
+			const rulesKey = this.watcherRulesKey()
+
 			if (this.watcherInstance) {
-				return
+				if (rulesKey === this.watcherInstanceRulesKey) {
+					return
+				}
+
+				// The ignore rules changed: rebuild, so newly ignored subtrees release their watches and newly
+				// included ones get watched. A change in the unwatched gap is caught by invalidating the tree cache
+				// (forces the next scan) — not by bumping lastDirectoryChangeTimestamp, which would also make this
+				// cycle sit out the settle wait in waitForLocalDirectoryChanges.
+				await this.watcherInstance.close()
+
+				this.watcherInstance = null
+				this.getDirectoryTreeCache.timestamp = 0
 			}
 
-			this.watcherInstance = await this.sync.environment.createWatcher(this.sync.syncPair.localPath, () => {
-				this.lastDirectoryChangeTimestamp = Date.now()
-			})
+			this.watcherInstance = await this.sync.environment.createWatcher(
+				this.sync.syncPair.localPath,
+				() => {
+					this.lastDirectoryChangeTimestamp = Date.now()
+				},
+				relativePath => this.isPathIgnoredByWatcher(relativePath)
+			)
+			this.watcherInstanceRulesKey = rulesKey
 
 			clearInterval(this.watcherInstanceFallbackInterval)
 		} catch (e) {

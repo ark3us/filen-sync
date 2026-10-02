@@ -19,6 +19,13 @@ export class Ignorer {
 		this.name = name
 	}
 
+	/**
+	 * The rule content the current matcher was built from (null before the first build or after clear()).
+	 */
+	public get appliedContent(): string | null {
+		return this.lastAppliedContent
+	}
+
 	public async fetch(): Promise<string> {
 		await this.mutex.acquire()
 

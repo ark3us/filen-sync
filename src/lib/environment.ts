@@ -46,8 +46,10 @@ export type SyncWatcher = {
 /**
  * Creates a recursive directory watcher that invokes `onChange` whenever something under `path`
  * changes. The default uses the native recursive `fs.watch`; tests inject a controllable no-op.
+ * `ignore` receives a path relative to `path` (platform separators); returning true skips that
+ * entry and, for a directory, everything below it.
  */
-export type SyncWatcherFactory = (path: string, onChange: () => void) => Promise<SyncWatcher>
+export type SyncWatcherFactory = (path: string, onChange: () => void, ignore: (relativePath: string) => boolean) => Promise<SyncWatcher>
 
 /**
  * All external, side-effecting dependencies of the sync engine, gathered behind one injectable
@@ -75,12 +77,14 @@ export function defaultEnvironment(): SyncEnvironment {
 		globFs: fsExtra,
 		writeFileAtomic: writeFileAtomicReal,
 		fetchDirTree: (sdk, request) => fetchDirTreeMsgpack(sdk, request),
-		createWatcher: async (path: string, onChange: () => void): Promise<SyncWatcher> => {
+		createWatcher: async (path: string, onChange: () => void, ignore: (relativePath: string) => boolean): Promise<SyncWatcher> => {
 			let closed = false
 			let watcher: fs.FSWatcher | undefined
 
 			const start = (): void => {
-				watcher = fs.watch(path, { recursive: true, persistent: true }, () => {
+				// On Linux, Node walks the tree itself and arms one inotify watch per directory (per file too on
+				// Node 24), consulting `ignore` BEFORE watching or descending — so an ignored subtree costs no watches.
+				watcher = fs.watch(path, { recursive: true, persistent: true, ignore }, () => {
 					onChange()
 				})
 
